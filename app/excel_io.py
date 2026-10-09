@@ -27,5 +27,6 @@ def export_workbook(path, portfolio, trades, lots, columns):
         sheet.auto_filter.ref = sheet.dimensions
         for col in sheet.columns:
             letter = col[0].column_letter
-            sheet.column_dimensions[letter].width = min(28, max(12, max(len(str(c.value or "")) for c in col[:100]) + 2))
+            limit = 52 if col[0].value == "Instrument" else 28
+            sheet.column_dimensions[letter].width = min(limit, max(12, max(len(str(c.value or "")) for c in col[:100]) + 2))
     book.save(path)

@@ -143,7 +143,7 @@ class CashMovementsTab(QWidget):
 
         self.transactions_pane = QWidget()
         transactions_layout = QVBoxLayout(self.transactions_pane)
-        transactions_layout.setContentsMargins(0, 0, 0, 0)
+        transactions_layout.setContentsMargins(12, 0, 0, 0)
         transactions_layout.setSpacing(6)
         self.transactions_pane.setMinimumHeight(135)
         self.transactions_pane.setMinimumWidth(360)
@@ -241,6 +241,8 @@ class CashMovementsTab(QWidget):
             self._setting_splitter = True
             try:
                 self.splitter.setOrientation(Qt.Vertical if splitter_stacked else Qt.Horizontal)
+                self.transactions_pane.layout().setContentsMargins(
+                    0 if splitter_stacked else 12, 12 if splitter_stacked else 0, 0, 0)
             finally:
                 self._setting_splitter = False
             self._splitter_stacked = splitter_stacked

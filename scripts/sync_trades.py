@@ -18,7 +18,8 @@ def main(database_path=None) -> int:
     except Exception as exc:
         reason = db.metadata("ibkr_flex_sync_error") or type(exc).__name__
         log.error("Trade sync stopped: %s: %s", type(exc).__name__, reason)
-        print(f"IBKR trade sync failed: {reason}", file=sys.stderr)
+        if sys.stderr is not None:
+            print(f"IBKR trade sync failed: {reason}", file=sys.stderr)
         return 1
     finally:
         db.conn.close()

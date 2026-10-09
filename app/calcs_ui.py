@@ -7,8 +7,8 @@ import time
 from copy import deepcopy
 from datetime import date, datetime
 
-from PySide6.QtCore import QByteArray, QEvent, QSize, QStringListModel, Qt, QTimer
-from PySide6.QtGui import QActionGroup, QColor, QIcon, QKeySequence, QPainter, QPixmap, QShortcut
+from PySide6.QtCore import QByteArray, QEvent, QStringListModel, Qt, QTimer
+from PySide6.QtGui import QActionGroup, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QCompleter, QDoubleSpinBox, QGridLayout, QHBoxLayout,
                                QHeaderView, QInputDialog, QLabel, QLineEdit, QMenu, QPushButton, QSizePolicy,
                                QVBoxLayout, QWidget)
@@ -16,8 +16,8 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox, QComp
 from app.calcs import calculate_targets, scale_target_weights, scenario_metrics
 from app.calculations import choose_price, valid_price
 from app.market_data import IBKRMarketDataProvider
-from app.table_ui import InputReportTable, SortItem
-from app.ui_theme import (COLORS, TOOLBAR_GROUP_SPACING, TOOLBAR_ITEM_SPACING,
+from app.table_ui import InputReportTable, SortItem, fit_option_name_column
+from app.ui_theme import (TOOLBAR_GROUP_SPACING, TOOLBAR_ITEM_SPACING,
                           style_toolbar_dropdown)
 
 
@@ -49,7 +49,6 @@ class CalcsTab(QWidget):
         self._search_labels = {}
         self._last_idea_quote_cache_at = 0.0
         self._frozen_snapshot = None
-        self._theme = "light"
         self._keyboard_controls = {}
         self._scenario_controls = {}
         self._setting_key = f"calcs_targets_{portfolio_id}"
@@ -97,8 +96,6 @@ class CalcsTab(QWidget):
         self.pause_button = QPushButton("Pause updates")
         self.pause_button.setObjectName("rebalanceSyncButton")
         self.pause_button.setProperty("syncState", "active")
-        self.pause_button.setIconSize(QSize(12, 12))
-        self._update_pause_icon()
         self.pause_button.setToolTip("Freeze prices, weights and cash in Rebalance while the other tabs keep syncing")
         self.pause_button.clicked.connect(self.toggle_pause)
         top.addWidget(self.pause_button)
@@ -222,22 +219,6 @@ class CalcsTab(QWidget):
     def updates_paused(self):
         return self._frozen_snapshot is not None
 
-    def set_theme(self, theme):
-        self._theme = theme if theme in COLORS else "light"
-        self._update_pause_icon()
-
-    def _update_pause_icon(self):
-        color = COLORS[self._theme]["sync_green" if self.updates_paused else "sync_red"]
-        pixmap = QPixmap(12, 12)
-        pixmap.fill(Qt.transparent)
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(color))
-        painter.drawEllipse(2, 2, 8, 8)
-        painter.end()
-        self.pause_button.setIcon(QIcon(pixmap))
-
     def toggle_pause(self):
         if self.updates_paused:
             self._frozen_snapshot = None
@@ -257,7 +238,6 @@ class CalcsTab(QWidget):
             self.pause_button.setText("Resume updates")
             self.pause_button.setToolTip("Rebalance is frozen; click to use the latest prices, weights and cash")
         self.pause_button.setProperty("syncState", "paused" if self.updates_paused else "active")
-        self._update_pause_icon()
         self.refresh()
 
     def _update_frozen_idea(self, ticker):
@@ -1065,6 +1045,8 @@ class CalcsTab(QWidget):
                      if abs(float(row.get("position_qty") or 0)) > 1e-9])
             self._reconcile_acquired_ideas(rows)
             rows.extend(deepcopy(snapshot["ideas"]) if snapshot else self._idea_rows())
+            fit_option_name_column(self.table, 0, (row.get("display_ticker") for row in rows),
+                                   self.db, f"option_name_width_Rebalance_{self.portfolio_id}")
             nav = snapshot["nav"] if snapshot else self.db.effective_nav(self.portfolio_id)
             cash_record = snapshot["cash_record"] if snapshot else self.db.account_value(self.portfolio_id, "TotalCashValue")
             if cash_record and cash_record["currency"] == "USD":
@@ -1092,7 +1074,9 @@ class CalcsTab(QWidget):
                 self._shown_targets[str(row["id"])] = target
                 snapshot_note = f"Paused Rebalance snapshot · {snapshot['as_of']}\n" if snapshot else ""
                 self._cell(index, 0, row["display_ticker"],
-                           tip=snapshot_note + str(row.get("contract_tooltip") or row.get("price_source") or ""),
+                           tip=snapshot_note + "\n".join(str(part) for part in
+                               (row["display_ticker"], row.get("raw_display_ticker"),
+                                row.get("contract_tooltip") or row.get("price_source")) if part),
                            position_id=row["id"])
                 self._cell(index, 1, self._number(row["position_qty"], 1), sort_value=row["position_qty"])
                 self._cell(index, 2, self._number(row.get("value"), 2), sort_value=row.get("value"))

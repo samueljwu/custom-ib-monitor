@@ -1,5 +1,6 @@
 """Shared color and spacing rules for the portfolio monitor."""
 
+from html import escape
 from string import Template
 
 
@@ -30,6 +31,13 @@ TOOLBAR_ITEM_SPACING = 8
 TOOLBAR_GROUP_SPACING = 16
 
 
+def status_link(theme, target, text):
+    """Keep status details readable instead of using Qt's default link blue."""
+    color = COLORS[theme]["accent_hover"]
+    return (f'<a href="{escape(target, quote=True)}" '
+            f'style="color: {color}; text-decoration: underline;">{escape(text)}</a>')
+
+
 def style_toolbar_dropdown(widget):
     """Give tab-level filter and menu controls the same compact shape."""
     widget.setObjectName("toolbarDropdown")
@@ -38,7 +46,7 @@ def style_toolbar_dropdown(widget):
 
 
 STYLESHEET = Template("""
-QMainWindow, QWidget#central, QWidget#settingsPage, QWidget#helpPage, QWidget#calcsPage,
+QMainWindow, QWidget#central, QWidget#settingsPage, QWidget#settingsStatus, QWidget#helpPage, QWidget#calcsPage,
 QWidget#analyticsContent, QWidget#analyticsPage, QWidget#analyticsSection,
 QScrollArea#analyticsScroller, QDialog, QScrollArea, QTabWidget::pane {
     background: ${canvas}; color: ${text};
@@ -48,8 +56,18 @@ QTabWidget#analyticsSections, QTabWidget#analyticsSections QTabBar {
 }
 QLabel { color: ${text}; }
 QLabel#settingsInfo { color: ${muted}; font-size: 12px; }
+QFrame#settingsSection { background: ${surface}; border: 1px solid ${line}; border-radius: 6px; }
+QLabel#settingsKey { color: ${muted}; }
+QLabel#settingsValue { color: ${text}; }
+QLabel#settingsWarning { color: ${warning}; }
+QToolButton#settingsDisclosure {
+    background: transparent; color: ${text}; border: 1px solid transparent;
+    text-align: left; padding: 5px 2px; font-size: 13px; font-weight: 600;
+}
+QToolButton#settingsDisclosure:hover { background: ${accent_soft}; }
+QToolButton#settingsDisclosure:focus { border-color: ${accent}; }
 QLabel#helpHeading { color: ${text}; font-size: 18px; font-weight: 600; }
-QLabel#helpSection { color: ${text}; font-size: 14px; font-weight: 600; }
+QLabel#helpSection, QLabel#settingsHeading { color: ${text}; font-size: 14px; font-weight: 600; }
 QLabel#helpKey { color: ${accent}; font-weight: 600; }
 QFrame#helpMockup { background: ${surface}; border: 1px solid ${line}; border-radius: 5px; }
 QLabel#helpMockTitle { color: ${text}; font-size: 12px; font-weight: 600; }
@@ -81,7 +99,7 @@ QLabel#metricValue[analyticsSelected="true"] { color: ${accent}; font-size: 21px
 QLabel#metricValue[pnlTrend="positive"] { color: ${positive}; }
 QLabel#metricValue[pnlTrend="negative"] { color: ${negative}; }
 QLabel#notice { color: ${warning}; font-size: 12px; }
-QLabel#syncProgressLabel, QLabel#tradeSyncStatus { color: ${text}; }
+QLabel#syncProgressLabel, QLabel#syncTimeLabel, QLabel#tradeSyncStatus, QLabel#historyStatus { color: ${text}; }
 QProgressBar#syncProgressBar {
     background: ${surface_alt}; border: 1px solid ${line}; border-radius: 4px;
 }
@@ -101,6 +119,11 @@ QPushButton#secondary, QPushButton#themeToggle {
 }
 QPushButton#secondary:hover, QPushButton#themeToggle:hover {
     background: ${accent_soft}; border-color: ${accent};
+}
+QPushButton[headerIcon="true"] { padding: 0; min-height: 30px; max-height: 30px; }
+QPushButton[headerIcon="true"]:focus { border-color: ${accent}; }
+QPushButton#secondary[headerIcon="true"]:pressed, QPushButton#themeToggle[headerIcon="true"]:pressed {
+    background: ${selection}; border-color: ${accent};
 }
 QPushButton#rebalanceSyncButton {
     background: ${surface}; color: ${text}; border-color: ${line};
@@ -177,13 +200,13 @@ QHeaderView::section {
 QHeaderView::section:vertical { border-right: 1px solid ${line}; }
 QTableCornerButton::section { background: ${surface_alt}; border: 0; border-bottom: 1px solid ${line}; }
 QScrollBar:vertical {
-    background: ${canvas}; border: 0; width: 10px; margin: 0;
+    background: ${canvas}; border: 0; width: 16px; margin: 0 3px;
 }
 QScrollBar::handle:vertical {
     background: ${line}; border-radius: 5px; min-height: 28px;
 }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-QScrollBar:horizontal { background: ${canvas}; border: 0; height: 10px; margin: 0; }
+QScrollBar:horizontal { background: ${canvas}; border: 0; height: 16px; margin: 3px 0; }
 QScrollBar::handle:horizontal { background: ${line}; border-radius: 5px; min-width: 28px; }
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 QTabWidget::pane { border: 0; border-top: 1px solid ${line}; }

@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QGridLayout, QHBoxL
 
 from app.exposure import add_custom_set, custom_sets, exposure_mix, exposure_snapshot
 from app.exposure_custom_ui import CustomSetDialog
-from app.table_ui import ReportTable, SortItem
+from app.table_ui import ReportTable, SortItem, fit_option_name_column
 from app.ui_theme import (COLORS, TOOLBAR_GROUP_SPACING, TOOLBAR_ITEM_SPACING,
                           style_toolbar_dropdown)
 
@@ -430,8 +430,10 @@ class ExposurePanel(QWidget):
                 if self.category_filter is None or row[field] == self.category_filter]
         self.positions.setSortingEnabled(False)
         self.positions.setRowCount(len(rows))
+        fit_option_name_column(self.positions, 0, (row["symbol"] for row in rows),
+                               self.db, f"option_name_width_Exposure_{self.portfolio_id}")
         for index, row in enumerate(rows):
-            detail = (f"Market: {_money(row['value'])} · Adjusted: {_money(row['adjusted'])}\n"
+            detail = (f"{row['symbol']}\nMarket: {_money(row['value'])} · Adjusted: {_money(row['adjusted'])}\n"
                       f"Price source: {row['price_source']}\n"
                       f"IBKR delta: {row['delta']} · {row['delta_mode'] or 'unavailable'} "
                       f"({row['delta_as_of'] or 'unavailable'})\n"

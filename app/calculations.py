@@ -8,6 +8,8 @@ import re
 import pandas as pd
 import numpy as np
 
+from app.trade_costs import trade_cost_usd
+
 
 def looks_like_option_ticker(display_ticker):
     """Safety check only; this is not a Bloomberg-to-IBKR contract converter."""
@@ -108,17 +110,24 @@ def closed_lot(buy, sell, qty):
     if (buy_multiplier is None or sell_multiplier is None or buy_multiplier != sell_multiplier or
         buy_fx is None or sell_fx is None):
         return {key: None for key in ("buy_value_usd", "sell_value_usd", "buy_commission",
-                                      "sell_commission", "realized_gross", "realized_net", "realized_pct")}
+                                      "sell_commission", "buy_tax", "sell_tax", "realized_gross", "realized_net", "realized_pct")}
     buy_value = qty * float(buy["price"]) * buy_multiplier * buy_fx
     sell_value = qty * float(sell["price"]) * sell_multiplier * sell_fx
     buy_comm = float(buy["commission_usd"] or 0) * qty / float(buy["quantity"])
     sell_comm = float(sell["commission_usd"] or 0) * qty / float(sell["quantity"])
     gross = sell_value - buy_value
-    net = gross - buy_comm - sell_comm
+    buy_tax = buy.get('tax_usd', 0)
+    sell_tax = sell.get('tax_usd', 0)
+    buy_tax = buy_tax * qty / float(buy['quantity']) if buy_tax is not None else None
+    sell_tax = sell_tax * qty / float(sell['quantity']) if sell_tax is not None else None
+    complete = trade_cost_usd(buy) is not None and trade_cost_usd(sell) is not None
+    net = gross - buy_comm - sell_comm - buy_tax - sell_tax if complete else None
+    basis = buy_value + buy_comm + buy_tax if complete else None
     return {"buy_value_usd": buy_value, "sell_value_usd": sell_value,
             "buy_commission": buy_comm, "sell_commission": sell_comm,
+            "buy_tax": buy_tax, "sell_tax": sell_tax,
             "realized_gross": gross, "realized_net": net,
-            "realized_pct": net / (buy_value + buy_comm) if buy_value + buy_comm else None}
+            "realized_pct": net / basis if net is not None and basis else None}
 
 
 def open_lot(buy, qty, current, current_fx):
@@ -127,16 +136,19 @@ def open_lot(buy, qty, current, current_fx):
     multiplier = valid_multiplier(buy.get("multiplier", 1))
     buy_fx, current_fx = valid_price(buy.get("fx_to_usd")), valid_price(current_fx)
     if multiplier is None or buy_fx is None or current_fx is None:
-        return {key: None for key in ("buy_value_usd", "buy_commission", "current_value",
+        return {key: None for key in ("buy_value_usd", "buy_commission", "buy_tax", "current_value",
                                       "net_unrealized", "unrealized_pct")}
     buy_value = qty * float(buy["price"]) * multiplier * buy_fx
     buy_comm = float(buy["commission_usd"] or 0) * qty / float(buy["quantity"])
     gross = qty * multiplier * (current * current_fx - float(buy["price"]) * buy_fx) if current else None
-    net = gross - buy_comm if gross is not None else None
-    return {"buy_value_usd": buy_value, "buy_commission": buy_comm,
+    buy_tax = buy.get('tax_usd', 0)
+    buy_tax = buy_tax * qty / float(buy['quantity']) if buy_tax is not None else None
+    net = gross - buy_comm - buy_tax if gross is not None and trade_cost_usd(buy) is not None else None
+    basis = buy_value + buy_comm + buy_tax if buy_tax is not None else None
+    return {"buy_value_usd": buy_value, "buy_commission": buy_comm, "buy_tax": buy_tax,
             "current_value": qty * multiplier * current * current_fx if current else None,
             "net_unrealized": net,
-            "unrealized_pct": net / (buy_value + buy_comm) if net is not None and buy_value + buy_comm else None}
+            "unrealized_pct": net / basis if net is not None and basis else None}
 
 
 def flow_adjusted_daily_pnl(current_qty, current_price, current_fx, prior_price, prior_fx,
@@ -155,11 +167,14 @@ def flow_adjusted_daily_pnl(current_qty, current_price, current_fx, prior_price,
             trade_mult = valid_multiplier(trade.get("multiplier"))
             if fx is None or trade_mult != multiplier:
                 return None
+            costs = trade_cost_usd(trade)
+            if costs is None:
+                return None
             units = Decimal(str(trade["quantity"]))
             sign = 1 if trade["side"] == "SELL" else -1
             prior_qty -= units if trade["side"] == "BUY" else -units
             trade_cash += (sign * units * Decimal(str(trade["price"])) * Decimal(str(fx)) *
-                           Decimal(str(multiplier)) - Decimal(str(trade["commission_usd"] or 0)))
+                           Decimal(str(multiplier)) - Decimal(str(costs)))
         current_value = Decimal(str(current_qty)) * Decimal(str(current_price)) * Decimal(str(current_fx)) * Decimal(str(multiplier))
         prior_value = prior_qty * Decimal(str(prior_price)) * Decimal(str(prior_fx)) * Decimal(str(multiplier))
         return float(current_value - prior_value + trade_cash)

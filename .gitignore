@@ -16,6 +16,7 @@ data/
 backups/
 reports/
 logs/
+history-import-status.json
 secrets/
 local_config.json
 .env*
@@ -23,3 +24,6 @@ build/
 dist/
 .venv/
 venv/
+.venv-release/
+*.dmg
+*.exe

@@ -4,12 +4,12 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
-import time
 import xml.etree.ElementTree as ET
 
-from app.flex_import import fetch_flex
+from app.flex_import import DEFAULT_REQUEST_PACING_SECONDS, FlexRequestPacer, FlexServiceError, fetch_flex, weekends_only
 from app.secret_store import load_flex_token
 from app.sync_service import single_writer_lock
+from app.history_coverage import catchup_windows, remember_account_open_day
 
 
 def _tag(node):
@@ -79,11 +79,17 @@ def parse_analytics_flex(xml, account_id, first, last):
         bases = {statement.get("baseCurrency")}
         for node in statement.iter():
             if _tag(node) == "AccountInformation":
+                if node.get("accountId") not in (None, "", account_id):
+                    raise ValueError("Analytics Flex Account Information account mismatch")
                 bases.add(node.get("baseCurrency"))
+                # IBKR's Account Information 'Currency' field is the account
+                # base currency; current reports emit it as currency="USD".
+                bases.add(node.get("currency"))
         if any(base not in (None, "", "USD") for base in bases):
             raise ValueError("Analytics currently requires a USD base account")
         if "USD" not in bases:
-            raise ValueError("Analytics Flex report must identify USD as the base currency")
+            raise ValueError("Analytics Flex report must identify USD as the base currency. "
+                             "Include Account Information > Currency in the Analytics Flex query.")
         for node in sections["EquitySummaryInBase"]:
             if _tag(node) != "EquitySummaryByReportDateInBase":
                 continue
@@ -135,32 +141,38 @@ def parse_analytics_flex(xml, account_id, first, last):
     covered_through = None
     for start, end in sorted(intervals):
         if covered_through is None:
-            if start != first:
+            if not weekends_only(first, (date.fromisoformat(start) - timedelta(days=1)).isoformat()):
                 raise ValueError("Analytics Flex report does not cover the requested dates")
-        elif date.fromisoformat(start) > date.fromisoformat(covered_through) + timedelta(days=1):
+        elif not weekends_only(
+                (date.fromisoformat(covered_through) + timedelta(days=1)).isoformat(),
+                (date.fromisoformat(start) - timedelta(days=1)).isoformat()):
             raise ValueError("Analytics Flex report has a date gap")
         covered_through = max(covered_through or end, end)
-    if covered_through != last:
+    # Daily breakout statements omit weekends. Keep their NAV dates as supplied
+    # and still reject an omitted weekday, including at either request boundary.
+    if not weekends_only((date.fromisoformat(covered_through) + timedelta(days=1)).isoformat(), last):
         raise ValueError("Analytics Flex report does not cover the requested dates")
+    if (date.fromisoformat(last) - date.fromisoformat(first)).days + 1 > 30:
+        # A year-wide statement header alone cannot prove daily NAV coverage.
+        day = date.fromisoformat(first)
+        through = date.fromisoformat(last)
+        while day <= through:
+            if day.weekday() < 5 and day.isoformat() not in valuations:
+                raise ValueError(f'Analytics Flex report is missing daily NAV for {day}; '
+                                 'enable daily breakout in the Analytics Flex query')
+            day += timedelta(days=1)
     return valuations, flows
 
 
 def planned_analytics_windows(db, account_id, today):
-    through = today - timedelta(days=1)
-    last = db.conn.execute("""SELECT MAX(to_day) FROM broker_sync_windows
-        WHERE account_id=? AND source='flex_analytics' AND status='complete'""", (account_id,)).fetchone()[0]
-    first = max(date(today.year - 4, 1, 1),
-                date.fromisoformat(last) - timedelta(days=7) if last else date.min)
-    windows = []
-    while first <= through:
-        end = min(first + timedelta(days=179), through)
-        windows.append((first.isoformat(), end.isoformat()))
-        first = end + timedelta(days=1)
-    return windows
+    return catchup_windows(db, account_id, 'analytics', today, 30)
 
 
 def run_analytics_flex_sync(db, account_id, query_id, *, portfolio_id=1, today=None, token=None,
-                            fetcher=fetch_flex, pacing_seconds=15, windows_override=None):
+                            fetcher=fetch_flex, pacing_seconds=DEFAULT_REQUEST_PACING_SECONDS, windows_override=None,
+                            on_window_start=None, on_window_complete=None,
+                            on_window_unavailable=None, request_pacer=None,
+                            stop_on_unavailable=False, backup=True):
     """Replay a dated Flex report without requiring a TWS/Gateway session."""
     if not account_id or not query_id:
         raise ValueError("IBKR account and Analytics Flex query ID are required")
@@ -169,26 +181,29 @@ def run_analytics_flex_sync(db, account_id, query_id, *, portfolio_id=1, today=N
     secret = token or load_flex_token(account_id)
     if not secret:
         raise ValueError("IBKR Flex token is missing; renew it in Client Portal")
-    with single_writer_lock(db.path, "ibkr-analytics-sync.lock"):
+    with single_writer_lock(db.path):
         windows = windows_override if windows_override is not None else planned_analytics_windows(db, account_id, today)
-        if windows:
+        if windows and backup:
             db.backup()
         count = 0
-        last_request = 0.0
-        for first, last in windows:
-            for attempt in range(3):
-                delay = pacing_seconds - (time.monotonic() - last_request)
-                if last_request and delay > 0:
-                    time.sleep(delay)
-                last_request = time.monotonic()
-                try:
-                    xml = fetcher(query_id, secret, from_day=first, to_day=last)
-                    break
-                except ValueError as exc:
-                    if not str(exc).startswith("Flex error 1003:") or attempt == 2:
-                        raise
-            valuations, flows = parse_analytics_flex(xml, account_id, first, last)
+        pacer = request_pacer or FlexRequestPacer(pacing_seconds)
+        pacer.configure(db, account_id)
+        unavailable = 0
+        processed = 0
+        def unavailable_window(first, last):
+            nonlocal unavailable
+            unavailable += 1
+            if on_window_unavailable:
+                on_window_unavailable(first, last)
+        for first, last, xml in pacer.reports(fetcher, query_id, secret, windows,
+                on_window_start, unavailable_window if on_window_unavailable else None):
+            try:
+                valuations, flows = parse_analytics_flex(xml, account_id, first, last)
+            except (ValueError, ET.ParseError):
+                pacer.invalidate()
+                raise
             with db.conn:
+                remember_account_open_day(db, account_id, xml)
                 db.conn.execute("""DELETE FROM account_history WHERE portfolio_id=?
                     AND source='flex' AND day BETWEEN ? AND ?""", (portfolio_id, first, last))
                 db.conn.execute("""DELETE FROM external_flows WHERE portfolio_id=?
@@ -215,5 +230,13 @@ def run_analytics_flex_sync(db, account_id, query_id, *, portfolio_id=1, today=N
                     imported_count=excluded.imported_count,completed_at=CURRENT_TIMESTAMP""",
                     (account_id, first, last, len(valuations), len(valuations)))
             count += len(valuations)
+            processed += 1
+            if on_window_complete:
+                on_window_complete(first, last)
         db.set_metadata("ibkr_analytics_sync_completed", datetime.now().isoformat(timespec="seconds"))
-        return {"windows": len(windows), "valuations": count}
+        if not unavailable:
+            db.set_metadata('ibkr_flex_paused', '')
+        result = {"windows": processed, "valuations": count}
+        if unavailable:
+            result["unavailable_windows"] = unavailable
+        return result

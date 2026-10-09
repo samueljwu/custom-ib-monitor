@@ -1,25 +1,82 @@
-# Historical IBKR reports
+# Set up IBKR history
 
-Create **three separate Activity Flex Queries** in IBKR Client Portal under **Performance & Reports → Flex Queries**. Use XML output, select only the account entered in the app, include every currency and instrument, and leave symbol filters empty. The app requests dated reports directly from IBKR Flex Web Service; no report file is uploaded to another service. Enter each query ID in **Settings**, then save one Flex token locally with `enter_flex_token.cmd`.
+Create three **Activity Flex Queries**: **Trades**, **Analytics** and **Cash**. The app supports one **USD base account** per database.
 
-| Query / Settings field | Required sections and fields | Used for |
-| --- | --- | --- |
-| **Trades** / Trades Flex query ID | **Trades** at **Executions** detail: Account ID, Trade ID or IB Execution ID, Trade Date/Time, Buy/Sell, Quantity, Trade Price, Conid, Symbol, Asset Category, Currency, Multiplier, FX Rate to Base, IB Commission and Commission Currency. For options, also Local Symbol, Expiry, Put/Call, and Strike. Include **Corporate Actions**, **Option Exercises/Assignments/Expirations**, and **Transfers** with account, transaction ID, date, action/direction, asset class, contract ID, symbol, quantity, currency, cost or proceeds, multiplier and FX Rate to Base where offered. Include Base Currency or USD conversion evidence. | Completed executions, transferred opening lots, supported security events, and reconciliation review. Unsupported events stay flagged for review. |
-| **Analytics** / Analytics Flex query ID | **Equity Summary in Base** with daily Report Date, Total NAV, and Cash; **Cash Transactions** with Report Date or Date/Time, Type, Amount, Currency, FX Rate to Base and Transaction ID; **Transfers** with date, direction, asset class, Position Amount in Base or cash amount, Currency, FX Rate to Base, and Transaction ID. Include Account Information with Base Currency, or a USD base declaration in each statement. | Completed daily NAV, cash balance, deposits/withdrawals, security transfers and flow-adjusted returns. Daily NAV rows and complete requested date coverage are needed. |
-| **Cash** / Cash Flex query ID | **Cash Report** for every statement currency: Currency, From/To Date, Starting/Ending Cash, Net Trades Sales/Purchases, Commissions, Deposits/Withdrawals, Dividends, Payment in Lieu, Withholding Tax, Broker Interest and Other Fees. **Cash Transactions**: Account ID, Currency, Report Date or Date/Time, Type, Amount, Description, and Transaction ID. | Dated nontrade cash activity and per-currency opening-to-closing balance checks. Unsupported transaction types or a broken bridge stop that period's import. |
+## 1. Open Flex Queries
 
-IBKR's field labels can vary by portal version. The required XML attributes are validated before a period is marked complete. The app currently expects a **USD base account** and one account per database. The Flex query must allow custom date requests and return the requested account and full date interval. Check the in-app sync status if IBKR cannot provide a section or older period. [IBKR Activity Flex reference](https://www.ibkrguides.com/reportingreference/reportguide/activity%20flex%20query%20reference.htm)
+1. Sign in to IBKR Client Portal.
+2. Click **Performance & Reports > Flex Queries**. Another route is **Menu > Reporting > Flex Queries**.
+3. Find **Activity Flex Query** and click its **+** button.
 
-## Import and coverage
+[IBKR's query setup instructions](https://www.ibkrguides.com/clientportal/performanceandstatements/activityflex.htm)
 
-1. Start the app once, enter the account and three query IDs in Settings, and save the Flex token. Use a local, unsynchronized data folder if changing the default.
-2. To fetch older history, close the app and run, for example:
+## 2. Create Trades
 
-   ```powershell
-   python -m scripts.import_history --source all --from-date 2023-01-01 --to-date 2023-12-31
-   ```
+1. Enter **Trades** in **Query Name**.
+2. Click **Account Information**. Tick **Account ID**, **Currency** and **Date Opened**, then click **Save**. Leave the other fields unticked. **Currency** means your account's base currency.
+3. Click **Trades**. Click **Select All** for the fields. Under **Level of Detail**, select **Executions** and **Closed Lots**. Click **Save**.
+4. Click **Open Positions**. Click **Select All** for the fields, select both **Summary** and **Lot** detail, then **Save**.
+5. Click **Corporate Actions > Select All > Save**.
+6. Click **Option Exercises, Assignments and Expirations > Select All > Save**.
+7. Click **Transfers > Select All > Save**.
+8. Follow **Save each query** below before creating Analytics.
 
-   You can use `--source trades`, `analytics`, or `cash` to import one report type. Use `--database C:\path\to\portfolio.sqlite3` only when you deliberately use a nondefault database. The command creates a local database backup before importing each source and processes short dated windows. Run cash periods in chronological order and choose dates that do not overlap existing imported cash periods.
-3. Reopen the app and press **Sync IBKR** to catch up completed days through yesterday. Without an older import, the first automatic Trades and Cash sync starts with recent 30 day windows; Analytics starts at the beginning of the fourth previous calendar year. Review **Trades**, **Analytics**, **Cash**, and sync status for missing dates or events needing review.
+Use **Select All** inside these section pop-ups, not across the whole page. Other sections can stay unselected. The detail choices are separate from the field checkboxes.
 
-IBKR controls the oldest available Flex history; an unavailable period cannot be reconstructed by this app. Live TWS/Gateway data supplies current positions, prices, FX, account values and recent executions, but not complete historical NAV or cash transactions. The app stores imported records in local SQLite, keeps backups and diagnostic logs locally, and does not save downloaded XML reports by default. SQLite files and backups are currently unencrypted; protect the local Windows account and backup folder.
+[Account Information fields](https://www.ibkrguides.com/reportingreference/reportguide/account%20information%20activity%20flex.htm) | [Trades detail](https://www.ibkrguides.com/reportingreference/reportguide/tradesfq.htm) | [Open Positions detail](https://www.ibkrguides.com/reportingreference/reportguide/open%20positionsfq.htm)
+
+## 3. Create Analytics
+
+1. Return to **Flex Queries**, click **+** under **Activity Flex Query**, and name it **Analytics**.
+2. Click **Account Information**. Tick **Account ID**, **Currency** and **Date Opened**, then **Save**.
+3. Click **Net Asset Value (NAV) in Base > Select All > Save**. This includes **Report Date**, **Total** and **Cash**.
+4. Click **Cash Transactions > Select All > Save**.
+5. Click **Transfers > Select All > Save**.
+6. Follow **Save each query** below. Set **Breakout by Day** to **Yes** for Analytics.
+
+The NAV section may also be labelled **Net Asset Value (NAV) Summary in Base**. It supplies daily account values. [IBKR NAV fields](https://www.ibkrguides.com/reportingreference/reportguide/net%20asset%20value%20(nav)%20summary%20in%20base.htm)
+
+## 4. Create Cash
+
+1. Return to **Flex Queries**, click **+** under **Activity Flex Query**, and name it **Cash**.
+2. Click **Account Information**. Tick **Account ID**, **Currency** and **Date Opened**, then **Save**.
+3. Click **Cash Report > Select All > Save**.
+4. Click **Cash Transactions > Select All > Save**. Keep every transaction type included if a type filter is offered.
+5. Follow **Save each query** below. Set **Breakout by Day** to **No** for Cash.
+
+Commission adjustments come through **Cash Transactions**; you do not need a separate Commission Details query. [IBKR explanation](https://www.interactivebrokers.com/en/?f=%2Fen%2Faccounts%2FreleaseNotes%2FStatement_Notes_Feb2013.php)
+
+## 5. Save each query
+
+Do this for **Trades**, **Analytics** and **Cash**:
+
+1. Leave **Filters > Symbols** empty.
+2. Under **Delivery Configuration**, click **Accounts > Add/Edit Accounts** and select only your app's account. Set **Format** to **XML** and **Period** to **Last 30 Calendar Days**. The app chooses its own dates when importing history.
+3. Under **General Configuration**, use these settings:
+
+   | Setting | Choose |
+   | --- | --- |
+   | Date Format | **yyyyMMdd** |
+   | Time Format | **HHmmss** |
+   | Date/Time Separator | **;** (semicolon) |
+   | Include Currency Rates | **Yes** |
+   | Display Account Alias in Place of Account ID | **No** |
+   | Breakout by Day | **Analytics: Yes. Trades and Cash: No.** |
+
+4. Click **Continue > Create**. Note the saved query's **Query ID**; reopen its details if needed.
+
+[IBKR configuration reference](https://www.ibkrguides.com/reportingreference/reportguide/delivery%20configuration%20and%20general%20configuration.htm)
+
+## 6. Connect the app
+
+1. In Client Portal, find **Flex Web Service Configuration** and click its **gear**.
+2. Turn **Flex Web Service** on. Copy the token shown. If it is expired, use **Generate A New Token**.
+3. In the app, open **Settings > History & Flex**. Paste each Query ID into its matching **Trades**, **Analytics** or **Cash** field.
+4. Click **Save settings**, then **Save Flex token**, and paste the token.
+5. Click **Import history**. First try a short past range with known activity; then import the older range you need.
+
+[IBKR token setup](https://www.ibkrguides.com/clientportal/performanceandstatements/flex-web-service.htm)
+
+Use **Sync IBKR** for later updates. **Pause import** saves the current report before stopping; **Resume import** skips history already saved.
+
+If dates are missing, open **Settings > History & Flex > Show all date ranges**. IBKR may not supply older periods. Use **Import older trades** for an older Activity Statement CSV; follow its instructions. This adds trades and verified transferred holdings only.

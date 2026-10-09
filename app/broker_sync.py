@@ -9,6 +9,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 from typing import Iterable
+from contextlib import nullcontext
 import xml.etree.ElementTree as ET
 
 
@@ -83,6 +84,7 @@ def record_from_tws(contract, execution, account_id: str) -> dict:
         "multiplier": _effective_multiplier(
             security_type, contract.multiplier or ("1" if security_type in {"STK", "CASH"} else None)),
         "fx_to_usd": 1.0 if str(contract.currency).upper() == "USD" else None,
+        "taxes": None,
         "commission": None, "commission_currency": str(contract.currency or "").upper(),
         "local_symbol": str(contract.localSymbol or ""),
         "expiry": str(contract.lastTradeDateOrContractMonth or ""),
@@ -160,6 +162,7 @@ def parse_flex_xml(xml_data: bytes, expected_account: str) -> tuple[list[dict], 
                 (raw.get("assetCategory") or "").upper(),
                 raw.get("multiplier") or ("1" if raw.get("assetCategory") == "STK" else None)),
             "fx_to_usd": _number(raw.get("fxRateToBase")),
+            "taxes": _number(raw.get("taxes")),
             "commission": _number(raw.get("ibCommission")),
             "commission_currency": (raw.get("ibCommissionCurrency") or "").upper(),
             "local_symbol": raw.get("localSymbol") or "",
@@ -181,13 +184,13 @@ class BrokerIngestor:
         db.validate_account_ownership(account_id)
         self.db, self.account_id, self.portfolio_id = db, account_id, portfolio_id
 
-    def ingest_many(self, records: Iterable[dict], source: str, window=None, events=()) -> IngestResult:
-        if source not in {"flex", "tws"}:
+    def ingest_many(self, records: Iterable[dict], source: str, window=None, events=(), *, transaction=True) -> IngestResult:
+        if source not in {"flex", "tws", "activity_statement"}:
             raise ValueError("Unsupported IBKR execution source")
         records = list(records)
         result = IngestResult()
         conn = self.db.conn
-        with conn:
+        with conn if transaction else nullcontext():
             accepted_count = 0
             for record in records:
                 if record.get("account_id") != self.account_id:
@@ -195,8 +198,17 @@ class BrokerIngestor:
                 if record.get("source", source) != source:
                     raise ValueError("Execution source mismatch")
                 accepted_count += bool(self._ingest_one(record, source, result))
+            # History arrives newest first. Retry splits once earlier purchases
+            # or transferred opening positions supply their missing share basis.
+            pending = [dict(kind="CorporateAction", raw=json.loads(row[0]))
+                       for row in conn.execute("""SELECT raw_json FROM broker_source_records
+                           WHERE account_id=? AND source='flex_event' AND status='review'
+                           AND issue LIKE 'Forward split requires ledger review:%'""",
+                                               (self.account_id,))]
+            event_by_id = {self._event_source_id(event): event for event in pending}
+            event_by_id.update((self._event_source_id(event), event) for event in events)
             split_groups = {}
-            for event in events:
+            for event in event_by_id.values():
                 raw = event.get("raw") or {}
                 if (event.get("kind") == "CorporateAction" and raw.get("type") == "FS" and
                     re.search(r"\bSPLIT\s+\d+\s+FOR\s+\d+\b", raw.get("actionDescription") or "", re.I)):
@@ -370,16 +382,10 @@ class BrokerIngestor:
             position_id = position[0]
             before = self.db.conn.execute("""SELECT COALESCE(SUM(CASE WHEN side='BUY' THEN quantity ELSE -quantity END),0)
                 FROM trades WHERE position_id=? AND trade_date<?""", (position_id, trade_day)).fetchone()[0]
-            after = self.db.conn.execute("""SELECT COALESCE(SUM(CASE WHEN side='BUY' THEN quantity ELSE -quantity END),0)
-                FROM trades WHERE position_id=?""", (position_id,)).fetchone()[0]
             stable_key = sha256(f"{con_id}|{trade_day}|{description}".encode()).hexdigest()[:16]
             trade_id = f"IBKR:{self.account_id}:CA:FS:{stable_key}"
-            prior = self.db.conn.execute("SELECT id FROM trades WHERE trade_id=?", (trade_id,)).fetchone()
-            if prior:
-                after -= self.db.conn.execute("SELECT quantity FROM trades WHERE id=?", (prior[0],)).fetchone()[0]
-            if (abs(float(quantity - Decimal(str(before)) * (ratio - 1))) > 1e-6 or
-                abs(after + float(quantity)) > 1e-6):
-                raise ValueError("split shares or eventual closing quantity do not reconcile")
+            if abs(float(quantity - Decimal(str(before)) * (ratio - 1))) > 1e-6:
+                raise ValueError("split shares do not reconcile with the pre-split holding")
             currency = (raw.get("currency") or "").upper()
             fx = 1.0 if currency == "USD" else _number(raw.get("fxRateToBase"))
             if not currency or not fx or fx <= 0:
@@ -533,7 +539,22 @@ class BrokerIngestor:
                 self.db.fx_rate(commission_currency, record["trade_date"]))
             if commission_fx is not None and commission_fx > 0:
                 commission_usd = (-commission if source == "flex" else commission) * commission_fx
+        # Flex/CSV tax amounts are signed cash flows. Store positive charges.
+        taxes = _number(record.get('taxes', 0))
+        tax_lc = -taxes if taxes is not None else None
+        tax_usd = tax_lc * fx if tax_lc is not None and fx and fx > 0 else None
+        if existing and tax_usd is None:
+            saved = conn.execute('SELECT * FROM trades WHERE id=?',
+                                 (existing['trade_row_id'],)).fetchone()
+            same_execution = (revision == existing['revision'] and saved['side'] == record['side']
+                              and saved['quantity'] == qty and saved['price'] == price
+                              and saved['trade_date'] == record['trade_date']
+                              and saved['currency'] == record['currency'])
+            if same_execution:
+                tax_lc, tax_usd = saved['tax_lc'], saved['tax_usd']
         pending = []
+        if tax_usd is None:
+            pending.append('tax')
         if fx is None or fx <= 0:
             pending.append("FX")
         if commission_usd is None:
@@ -544,6 +565,7 @@ class BrokerIngestor:
             result.execution_review += 1
             result.issues.append(f"{source_id}: {status}")
         quality = 2 if source == "flex" else 1
+        source_label = ("IBKR Activity Statement" if source == "activity_statement" else "IBKR sync")
         if existing:
             row_id = existing["trade_row_id"]
             old = conn.execute("SELECT * FROM trades WHERE id=?", (row_id,)).fetchone()
@@ -572,12 +594,12 @@ class BrokerIngestor:
                 conn.execute("""DELETE FROM trade_matches WHERE origin='auto'
                     AND (buy_trade_id=? OR sell_trade_id=?)""", (row_id, row_id))
                 conn.execute("""UPDATE trades SET trade_date=?,executed_at=?,side=?,quantity=?,price=?,
-                    currency=?,security_type=?,multiplier=?,fx_to_usd=?,commission_usd=?,source='IBKR sync',
+                    currency=?,security_type=?,multiplier=?,fx_to_usd=?,commission_usd=?,source=?,
                     updated_at=CURRENT_TIMESTAMP WHERE id=?""",
                     (record["trade_date"], record.get("executed_at") or "", record["side"], qty,
                      price, record["currency"], record["security_type"], multiplier,
                      fx if fx is not None else old["fx_to_usd"],
-                     commission_usd if commission_usd is not None else old["commission_usd"], row_id))
+                     commission_usd if commission_usd is not None else old["commission_usd"], source_label, row_id))
                 conn.execute("""UPDATE broker_executions SET latest_exec_id=?,revision=?,quality=?,
                     status=?,updated_at=CURRENT_TIMESTAMP WHERE account_id=? AND execution_key=?""",
                     (record.get("ib_exec_id") or existing["latest_exec_id"], max(revision, existing["revision"]),
@@ -585,6 +607,7 @@ class BrokerIngestor:
                 result.updated += 1
                 result.changed_position_ids.add(position_id)
             elif quality >= existing["quality"] and revision >= existing["revision"] and (
+                (tax_usd is not None and (old["tax_usd"] is None or abs(old["tax_usd"] - tax_usd) > 1e-9)) or
                 (commission_usd is not None and abs(old["commission_usd"] - commission_usd) > 1e-9) or
                 (commission_usd is not None and "commission" in existing["status"] and status != existing["status"]) or
                 (record["security_type"] == "BOND" and abs(old["multiplier"] - multiplier) > 1e-9) or
@@ -611,7 +634,7 @@ class BrokerIngestor:
                  record["trade_date"], record.get("executed_at") or "",
                  conn.execute("SELECT display_ticker FROM positions WHERE id=?", (position_id,)).fetchone()[0],
                  record["symbol"], record["side"], qty, price, record["security_type"], multiplier,
-                 record["currency"], fx or 0.0, commission_usd or 0.0, "IBKR sync"))
+                 record["currency"], fx or 0.0, commission_usd or 0.0, source_label))
             row_id = cur.lastrowid
             conn.execute("""INSERT INTO broker_executions
                 (account_id,execution_key,trade_row_id,latest_exec_id,revision,quality,status)
@@ -619,5 +642,10 @@ class BrokerIngestor:
                 (self.account_id, key, row_id, record.get("ib_exec_id") or "", revision, quality, status))
             result.inserted += 1
             result.changed_position_ids.add(position_id)
+        # Lower quality or older callbacks must not erase verified Flex taxes.
+        if not existing or revision > existing['revision'] or (quality >= existing['quality'] and revision >= existing['revision']):
+            accepted_fx = conn.execute('SELECT fx_to_usd FROM trades WHERE id=?', (row_id,)).fetchone()[0]
+            tax_usd = tax_lc * accepted_fx if tax_lc is not None and accepted_fx and accepted_fx > 0 else None
+            conn.execute('UPDATE trades SET tax_lc=?,tax_usd=? WHERE id=?', (tax_lc, tax_usd, row_id))
         self._record_source(source, source_id, key, row_id, status, "", record)
         return True

@@ -8,6 +8,19 @@ from PySide6.QtGui import QActionGroup, QKeySequence
 from PySide6.QtWidgets import (QAbstractItemView, QAbstractSpinBox, QApplication, QComboBox,
                                QInputDialog, QLineEdit, QMenu, QTableWidget, QTableWidgetItem)
 
+from app.clipboard_ui import add_table_copy_actions, copy_table_selection
+
+
+def fit_option_name_column(table, column, names, db, setting_key):
+    """Widen a name column once when descriptive options first appear."""
+    names = [str(name) for name in names if name and " · " in str(name)
+             and (" Call " in str(name) or " Put " in str(name))]
+    if not names or db.setting(setting_key) == "1":
+        return
+    width = min(440, max(table.fontMetrics().horizontalAdvance(name) + 28 for name in names))
+    table.setColumnWidth(column, max(table.columnWidth(column), width))
+    db.set_setting(setting_key, "1")
+
 
 def handle_table_shortcut(view, event):
     """Apply the same row, column, and copy shortcuts in every data table."""
@@ -31,21 +44,7 @@ def handle_table_shortcut(view, event):
             view.selectionModel().setCurrentIndex(anchor, QItemSelectionModel.NoUpdate)
         return True
     if event.matches(QKeySequence.Copy):
-        indexes = view.selectedIndexes()
-        if indexes:
-            top = min(index.row() for index in indexes)
-            left = min(index.column() for index in indexes)
-            bottom = max(index.row() for index in indexes)
-            right = max(index.column() for index in indexes)
-            selected = {(index.row(), index.column()) for index in indexes}
-            lines = []
-            for row in range(top, bottom + 1):
-                values = []
-                for column in range(left, right + 1):
-                    value = view.model().data(view.model().index(row, column), Qt.EditRole)
-                    values.append(str(value) if (row, column) in selected and value is not None else "")
-                lines.append("\t".join(values))
-            QApplication.clipboard().setText("\n".join(lines))
+        copy_table_selection(view)
         return True
     return False
 
@@ -83,6 +82,22 @@ class ReportTable(QTableWidget):
         self._settings_key = None
         self._allow_header_sort = True
         self.horizontalHeader().viewport().installEventFilter(self)
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._cell_menu)
+
+    def _build_cell_menu(self):
+        menu = add_table_copy_actions(QMenu(self), self)
+        if isinstance(self, InputReportTable):
+            paste = menu.addAction("Paste")
+            paste.setEnabled(self._paste_editor() is not None)
+            paste.triggered.connect(self.paste_current_cell)
+        return menu
+
+    def _cell_menu(self, point):
+        index = self.indexAt(point)
+        if index.isValid() and index not in self.selectedIndexes():
+            self.setCurrentIndex(index)
+        self._build_cell_menu().exec(self.viewport().mapToGlobal(point))
 
     def eventFilter(self, watched, event):
         if (watched is self.horizontalHeader().viewport() and event.type() == QEvent.MouseButtonPress
@@ -291,6 +306,10 @@ class InputReportTable(ReportTable):
         return None
 
     def keyPressEvent(self, event):
+        if event.matches(QKeySequence.Paste):
+            self.paste_current_cell()
+            event.accept()
+            return
         if event.modifiers() == Qt.NoModifier and event.key() in self.DIRECTIONS:
             self.move_cell(self.currentRow() if self.currentRow() >= 0 else 0,
                            self.currentColumn() if self.currentColumn() >= 0 else 0, event.key())
@@ -305,6 +324,24 @@ class InputReportTable(ReportTable):
                 event.accept()
                 return
         super().keyPressEvent(event)
+
+    def _paste_editor(self):
+        editor = self._cell_editor(self.currentRow(), self.currentColumn())
+        if editor is None or not editor.isEnabled():
+            return None
+        if isinstance(editor, QAbstractSpinBox):
+            return editor.lineEdit() if not editor.isReadOnly() else None
+        if isinstance(editor, QComboBox):
+            return editor.lineEdit() if editor.isEditable() and not editor.lineEdit().isReadOnly() else None
+        return editor if not editor.isReadOnly() else None
+
+    def paste_current_cell(self):
+        editor = self._paste_editor()
+        text = QApplication.clipboard().text()
+        if editor is not None and not any(separator in text for separator in ("\t", "\n", "\r")):
+            editor.setFocus()
+            editor.selectAll()
+            editor.paste()
 
     def eventFilter(self, watched, event):
         binding = self._input_bindings.get(watched)

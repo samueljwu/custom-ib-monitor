@@ -22,7 +22,8 @@ def main(database_path=None):
         db.set_metadata("ibkr_analytics_sync_status", "failed")
         db.set_metadata("ibkr_analytics_sync_error", str(exc)[:500])
         log.error("Analytics history sync failed: %s", type(exc).__name__)
-        print(f"IBKR Analytics history sync failed: {type(exc).__name__}", file=sys.stderr)
+        if sys.stderr is not None:
+            print(f"IBKR Analytics history sync failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     finally:
         db.conn.close()

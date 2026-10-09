@@ -1,4 +1,4 @@
-"""Store the IBKR Flex token in the current Windows user's Credential Manager."""
+"""Store the IBKR Flex token in the OS credential store."""
 
 from __future__ import annotations
 
@@ -45,6 +45,10 @@ def _api():
 def save_flex_token(account_id: str, token: str):
     if not account_id or not token.isdecimal() or len(token) < 16:
         raise ValueError("Invalid account or Flex token")
+    if sys.platform == "darwin":
+        from keyring.backends.macOS import Keyring
+        Keyring().set_password(_TARGET_PREFIX + account_id, account_id, token)
+        return
     data = token.encode("utf-16-le")
     blob = (ctypes.c_ubyte * len(data)).from_buffer_copy(data)
     credential = _CREDENTIAL()
@@ -59,6 +63,9 @@ def save_flex_token(account_id: str, token: str):
 
 
 def load_flex_token(account_id: str) -> str | None:
+    if sys.platform == "darwin":
+        from keyring.backends.macOS import Keyring
+        return Keyring().get_password(_TARGET_PREFIX + account_id, account_id)
     pointer = ctypes.POINTER(_CREDENTIAL)()
     api = _api()
     if not api.CredReadW(_TARGET_PREFIX + account_id, _CRED_TYPE_GENERIC, 0,

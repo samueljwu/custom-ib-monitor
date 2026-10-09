@@ -1,9 +1,14 @@
 """Portfolio projections and auditable many-to-many trade matching."""
 
 from collections import defaultdict
+from contextlib import nullcontext
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
+
+from app.trade_costs import trade_cost_usd
+from app.instrument_names import InstrumentNames
+from app.returns import open_short_rows
 
 from app.calculations import (adv20, advx, choose_price, closed_lot, flow_adjusted_daily_pnl,
                               historical_returns, looks_like_option_ticker, open_lot,
@@ -30,7 +35,7 @@ class MatchingService:
             return (buy["executed_at"], buy["id"]) < (sell["executed_at"], sell["id"])
         return buy["id"] < sell["id"]
 
-    def match(self, sell_id, allocations, origin="manual"):
+    def match(self, sell_id, allocations, origin="manual", *, transaction=True):
         trades = {t["id"]: t for t in self.db.rows("trades", self.portfolio_id)}
         if sell_id not in trades:
             raise ValueError("SELL is outside this portfolio")
@@ -59,7 +64,7 @@ class MatchingService:
             if qty > remaining[buy_id] + 1e-9:
                 raise ValueError("Matched quantity exceeds remaining BUY quantity")
             seen.add(buy_id)
-        with self.db.conn:
+        with self.db.conn if transaction else nullcontext():
             self.db.conn.executemany(
                 "INSERT INTO trade_matches(buy_trade_id,sell_trade_id,matched_qty,origin) VALUES (?,?,?,?)",
                 [(buy_id, sell_id, qty, origin) for buy_id, qty in allocations])
@@ -99,7 +104,7 @@ class MatchingService:
     @staticmethod
     def _gain_per_unit(buy, sell):
         """Net USD gain for one unit, including pro-rata commissions."""
-        if not buy.get("commission_complete", True) or not sell.get("commission_complete", True):
+        if trade_cost_usd(buy) is None or trade_cost_usd(sell) is None:
             return None
         try:
             multiplier = Decimal(str(sell["multiplier"]))
@@ -112,9 +117,9 @@ class MatchingService:
             if buy_qty <= 0 or sell_qty <= 0:
                 return None
             return (Decimal(str(sell["price"])) * multiplier * sell_fx -
-                    Decimal(str(sell["commission_usd"] or 0)) / sell_qty -
+                    Decimal(str(trade_cost_usd(sell))) / sell_qty -
                     Decimal(str(buy["price"])) * multiplier * buy_fx -
-                    Decimal(str(buy["commission_usd"] or 0)) / buy_qty)
+                    Decimal(str(trade_cost_usd(buy))) / buy_qty)
         except (ValueError, TypeError, ArithmeticError):
             return None
 
@@ -187,7 +192,7 @@ class MatchingService:
                 if need <= 1e-9:
                     break
 
-    def rebuild_auto(self, position_ids=None):
+    def rebuild_auto(self, position_ids=None, *, transaction=True):
         """Recalculate automatic matches; keep manually adjusted allocations fixed."""
         trades = {t["id"]: t for t in self.db.rows("trades", self.portfolio_id)}
         selected = set(position_ids) if position_ids is not None else {t["position_id"] for t in trades.values()}
@@ -232,7 +237,7 @@ class MatchingService:
                     remaining[sell["id"]] -= qty
                 if remaining[buy["id"]] <= 1e-9:
                     break
-        with self.db.conn:
+        with self.db.conn if transaction else nullcontext():
             self.db.conn.executemany("DELETE FROM trade_matches WHERE match_id=?", [(key,) for key in auto_ids])
             self.db.conn.executemany("""INSERT INTO trade_matches
                 (buy_trade_id,sell_trade_id,matched_qty,origin) VALUES (?,?,?,?)""", allocations)
@@ -277,9 +282,12 @@ class MatchingService:
 
     def trade_rows(self):
         remaining = self.remaining()
+        names = InstrumentNames(self.db, self.portfolio_id)
         result = []
         for trade in self.db.rows("trades", self.portfolio_id):
             row = dict(trade)
+            row["raw_display_ticker"] = trade["display_ticker"]
+            row["display_ticker"] = names.trade(trade)
             if not trade["commission_complete"]:
                 row["commission_usd"] = None
             multiplier = valid_multiplier(trade["multiplier"])
@@ -289,7 +297,8 @@ class MatchingService:
             row["valuation_status"] = ("VERIFY SECURITY TYPE" if trade["security_type"] == "STK" and
                                        looks_like_option_ticker(trade["display_ticker"]) else
                                        "MULTIPLIER REQUIRED" if multiplier is None else
-                                       "FX REQUIRED" if fx is None else "OK")
+                                       "FX REQUIRED" if fx is None else
+                                       "TAX REQUIRED" if row['tax_usd'] is None else "OK")
             if row["valuation_status"] == "VERIFY SECURITY TYPE":
                 row["gross_lc"] = row["gross_usd"] = None
             row["matched_qty"] = trade["quantity"] - remaining[trade["id"]]
@@ -324,7 +333,116 @@ class PortfolioService:
         self.portfolio_id = portfolio_id
         self.matching = MatchingService(db, portfolio_id)
 
+    def trade_rows(self, portfolio_rows=None, lots_rows=None):
+        """Execution P&L from existing matches and the current valuation snapshot.
+
+        A closed lot's realized gain is shown on both its BUY and SELL. Account
+        totals must continue to use lots, where every match occurs only once.
+        """
+        rows = self.matching.trade_rows()
+        valuations = portfolio_rows if portfolio_rows is not None else self.portfolio_rows()
+        positions = {row["id"]: row for row in valuations}
+        lots = lots_rows if lots_rows is not None else self.lots_rows(valuations)
+        closed, opened = defaultdict(list), {}
+        for lot in lots:
+            if lot["lot_state"].startswith("Closed"):
+                closed[lot["buy_trade_id"]].append(lot)
+                closed[lot["sell_trade_id"]].append(lot)
+            elif lot["lot_state"] == "Open":
+                opened[lot["buy_trade_id"]] = lot
+        shorts = {lot["sell_trade_id"]: lot for lot in open_short_rows(rows, valuations)}
+        for row in rows:
+            row.update(last_price=None, price_source="", realized_net=None,
+                       net_unrealized=None, realized_pct=None, unrealized_pct=None,
+                       pnl_note="", realized_note="No matched closures",
+                       open_note="No remaining open quantity", last_price_note="Price unavailable")
+            if row["security_type"] == "CASH":
+                row["pnl_note"] = row["realized_note"] = row["open_note"] = row["last_price_note"] = "FX cash activity"
+                row["realized_pct_note"] = row["unrealized_pct_note"] = "FX cash activity"
+                continue
+            position = positions.get(row["position_id"], {})
+            compatible = (position.get("security_type") == row["security_type"]
+                          and position.get("multiplier") == row["multiplier"])
+            if compatible and row["valuation_status"] != "VERIFY SECURITY TYPE":
+                row["last_price"] = position.get("last_px")
+                row["price_source"] = position.get("price_source", "")
+                if row["last_price"] is not None:
+                    row["last_price_note"] = " · ".join(part for part in
+                        (row["price_source"], position.get("last_updated", "")) if part)
+            elif position:
+                row["last_price_note"] = "Instrument type or multiplier differs from current contract"
+            notes = set()
+            matched = closed[row["id"]]
+            if matched:
+                values = [lot.get("realized_net") for lot in matched]
+                row["realized_net"] = sum(values) if all(value is not None for value in values) else None
+                row["realized_note"] = "" if row["realized_net"] is not None else "; ".join(sorted({
+                    lot.get("lot_note") or "Lot valuation incomplete" for lot in matched
+                    if lot.get("realized_net") is None}))
+                if row["realized_note"]:
+                    notes.add(row["realized_note"])
+            lot = opened.get(row["id"]) if row["side"] == "BUY" else shorts.get(row["id"])
+            if lot:
+                row["net_unrealized"] = lot.get("net_unrealized")
+                row["open_note"] = ("Unmatched sale / short quantity unverified"
+                                    if lot["lot_state"] == "Unmatched sale" else
+                                    lot.get("lot_note") or "Open valuation incomplete")
+                if row["net_unrealized"] is None:
+                    if lot["lot_state"] != "Unmatched sale" and row["open_note"] not in ("Fee pending", "IBKR qty differs"):
+                        if not row["cost_complete"]:
+                            row["open_note"] = "Fee pending"
+                        elif valid_multiplier(row["multiplier"]) is None:
+                            row["open_note"] = "Multiplier required"
+                        elif valid_price(row["fx_to_usd"]) is None or valid_price(position.get("fx_to_usd")) is None:
+                            row["open_note"] = "FX required"
+                        elif not compatible:
+                            row["open_note"] = "Instrument type or multiplier differs from current contract"
+                        elif row["last_price"] is None:
+                            row["open_note"] = "Price unavailable"
+                    notes.add(row["open_note"])
+                if lot["lot_state"] == "Open short":
+                    row["match_status"] = "Partially covered" if matched else "Open short"
+            if row["valuation_status"] == "VERIFY SECURITY TYPE":
+                row["realized_net"] = row["net_unrealized"] = row["last_price"] = None
+                row["realized_note"] = row["open_note"] = row["last_price_note"] = "Verify security type"
+                notes.add("Verify security type")
+            elif row["side"] == "BUY" and any(lot["lot_state"] == "Closed short" for lot in matched):
+                row["match_status"] = "Partially open / short cover" if row["remaining_qty"] > 1e-9 else "Short cover"
+            row["realized_pct"] = self._trade_pnl_pct(row["realized_net"],
+                [self._trade_entry_basis(item) for item in matched])
+            if lot and lot["lot_state"] == "Open short" and row["net_unrealized"] is not None:
+                basis = (row["gross_usd"] - trade_cost_usd(row)) * row["remaining_qty"] / row["quantity"]
+            else:
+                basis = self._trade_entry_basis(lot) if lot else None
+            row["unrealized_pct"] = self._trade_pnl_pct(row["net_unrealized"], [basis])
+            for field, note, pnl, reason in (("realized_pct", "realized_pct_note", "realized_net", "realized_note"),
+                                             ("unrealized_pct", "unrealized_pct_note", "net_unrealized", "open_note")):
+                row[note] = (row[reason] if row[pnl] is None else
+                             "Entry basis unavailable or non-positive" if row[field] is None else "")
+                if row[pnl] is not None and row[field] is None:
+                    notes.add(row[note])
+            row["pnl_note"] = "; ".join(sorted(notes))
+        return rows
+
+    @staticmethod
+    def _trade_entry_basis(lot):
+        if lot["lot_state"] == "Closed short":
+            value, fee, sign = lot.get("sell_value_usd"), lot.get("sell_commission"), -1
+            tax = lot.get("sell_tax", 0)
+        else:
+            value, fee, sign = lot.get("buy_value_usd"), lot.get("buy_commission"), 1
+            tax = lot.get("buy_tax", 0)
+        return value + sign * (fee + tax) if value is not None and fee is not None and tax is not None else None
+
+    @staticmethod
+    def _trade_pnl_pct(pnl, bases):
+        if pnl is None or any(basis is None for basis in bases):
+            return None
+        basis = valid_price(sum(bases))
+        return pnl / basis if basis is not None else None
+
     def portfolio_rows(self):
+        names = InstrumentNames(self.db, self.portfolio_id)
         trades = self.db.rows("trades", self.portfolio_id)
         remaining = self.matching.remaining()
         ledger = defaultdict(float)
@@ -341,6 +459,8 @@ class PortfolioService:
             if position["security_type"] == "CASH":
                 continue  # FX pair executions do not represent security holdings.
             row = dict(position)
+            row["raw_display_ticker"] = position["display_ticker"]
+            row["display_ticker"] = names.position(position)
             position_trades = by_position[position["id"]]
             open_buys = [(t, remaining[t["id"]]) for t in position_trades
                          if t["side"] == "BUY" and remaining[t["id"]] > 1e-9]
@@ -353,11 +473,11 @@ class PortfolioService:
                                   abs(open_qty - row["position_qty"]) < 1e-9 and
                                   multiplier is not None and all(
                                       valid_price(t["fx_to_usd"]) is not None and
-                                      t["multiplier"] == multiplier and t["commission_complete"]
+                                      t["multiplier"] == multiplier and t["cost_complete"]
                                       for t, _ in open_buys))
             row["average_cost"] = (
                 sum(qty * (t["price"] * multiplier +
-                           t["commission_usd"] / t["quantity"] / t["fx_to_usd"])
+                           trade_cost_usd(t) / t["quantity"] / t["fx_to_usd"])
                     for t, qty in open_buys) / (open_qty * multiplier)
                 if complete_open_lots else None)
             current_fx = self.db.fx_rate(position["currency"], date.today().isoformat())
@@ -397,18 +517,44 @@ class PortfolioService:
             # acquisition FX and allocated fee.
             row["unrealized_pnl"] = row["unrealized_pct"] = None
             prior_day = prior_bar["day"] if prior_bar else (as_of - timedelta(days=1)).isoformat()
+            prior_fx = self.db.fx_rate(position["currency"], prior_day)
+            today_trades = [t for t in position_trades if t["trade_date"] == as_of.isoformat()]
             row["daily_pnl"] = flow_adjusted_daily_pnl(
                 row["position_qty"], price, current_fx, prior_close,
-                self.db.fx_rate(position["currency"], prior_day), position["multiplier"],
-                [t for t in position_trades if t["trade_date"] == as_of.isoformat()])
-            if (cached_close and source != f"SAVED SESSION BAR {as_of.isoformat()}") or source == "CLOSE" or source.startswith("CACHED QUOTE"):
+                prior_fx, position["multiplier"], today_trades)
+            stale_daily_price = ((cached_close and source != f"SAVED SESSION BAR {as_of.isoformat()}")
+                                 or source == "CLOSE" or source.startswith("CACHED QUOTE"))
+            if stale_daily_price:
                 row["daily_pnl"] = None
+            daily_reasons = []
+            if row["daily_pnl"] is None:
+                if suspect_option:
+                    daily_reasons.append("verify security type")
+                elif valid_price(price) is None:
+                    daily_reasons.append("missing current-session price")
+                elif stale_daily_price:
+                    daily_reasons.append(f"current-session price not updated ({source})")
+                if valid_price(prior_close) is None:
+                    daily_reasons.append("missing prior close")
+                if valid_price(current_fx) is None:
+                    daily_reasons.append(f"missing current {position['currency']}/USD FX")
+                if valid_price(prior_fx) is None:
+                    daily_reasons.append(f"missing prior {position['currency']}/USD FX")
+                if multiplier is None:
+                    daily_reasons.append("missing contract multiplier")
+                if any(valid_price(t.get("fx_to_usd")) is None for t in today_trades):
+                    daily_reasons.append("missing same-day trade FX")
+                if any(valid_multiplier(t.get("multiplier")) != multiplier for t in today_trades):
+                    daily_reasons.append("same-day trade multiplier mismatch")
+                if not daily_reasons:
+                    daily_reasons.append("invalid daily P&L inputs")
+            row["daily_pnl_note"] = "; ".join(daily_reasons)
             if complete_open_lots:
                 lots = [open_lot(buy, qty, price, current_fx) for buy, qty in open_buys]
                 row["unrealized_pnl"] = (sum(lot["net_unrealized"] for lot in lots)
                                          if all(lot["net_unrealized"] is not None for lot in lots) else None)
-                basis = sum(lot["buy_value_usd"] + lot["buy_commission"] for lot in lots
-                            if lot["buy_value_usd"] is not None and lot["buy_commission"] is not None)
+                basis = sum(lot["buy_value_usd"] + lot["buy_commission"] + lot.get("buy_tax", 0) for lot in lots
+                            if lot["buy_value_usd"] is not None and lot["buy_commission"] is not None and lot.get("buy_tax", 0) is not None)
                 row["unrealized_pct"] = (row["unrealized_pnl"] / basis
                                          if row["unrealized_pnl"] is not None and basis > 0 and
                                          all(lot["buy_value_usd"] is not None for lot in lots) else None)
@@ -435,7 +581,7 @@ class PortfolioService:
                 row["data_status"] = "NO TRADES"
             elif any(t["side"] == "SELL" and remaining[t["id"]] > 1e-9 for t in position_trades):
                 row["data_status"] = "UNMATCHED SALE"
-            elif any(not t["commission_complete"] for t, qty in open_buys if qty > 1e-9):
+            elif any(not t["cost_complete"] for t, qty in open_buys if qty > 1e-9):
                 row["data_status"] = "FEE PENDING"
             row["adv20"] = adv20(history)
             row["advx"] = advx(row["position_qty"], row["adv20"])
@@ -448,6 +594,7 @@ class PortfolioService:
             row["reconciliation"] = ("NOT CHECKED" if broker_qty is None else
                                      "OK" if abs(row["qty_difference"]) < 1e-9 else "DIFFERENCE")
             if row["reconciliation"] == "DIFFERENCE":
+                row["daily_pnl_note"] = "position quantity differs from broker"
                 if position_trades:
                     row["data_status"] = "POSITION DIFFERENCE"
                 for key in ("value", "portfolio_pct", "daily_pnl", "unrealized_pnl", "unrealized_pct"):
@@ -456,6 +603,7 @@ class PortfolioService:
         return rows
 
     def lots_rows(self, portfolio_rows=None):
+        names = InstrumentNames(self.db, self.portfolio_id)
         trades = {t["id"]: t for t in self.db.rows("trades", self.portfolio_id)}
         positions = {p["id"]: p for p in self.db.rows("positions", self.portfolio_id)}
         valuations = {p["id"]: p for p in (portfolio_rows if portfolio_rows is not None else self.portfolio_rows())}
@@ -469,14 +617,14 @@ class PortfolioService:
             row = self._base_lot(buy, qty)
             short = match["origin"] == "auto_short"
             row["lot_state"] = "Closed short" if short else "Closed"
-            row.update({"match_id": match["match_id"], "sell_date": sell["trade_date"],
+            row.update({"match_id": match["match_id"], "sell_trade_id": sell["id"], "sell_date": sell["trade_date"],
                         "sell_qty": qty, "sell_price": sell["price"], "sell_currency": sell["currency"],
                         "sell_fx": sell["fx_to_usd"], "sell_notes": sell["notes"],
                         "sell_value_lc": qty * sell["price"] * sell["multiplier"] if valid_multiplier(sell["multiplier"]) else None,
                         "duration": abs((date.fromisoformat(sell["trade_date"]) - date.fromisoformat(buy["trade_date"])).days)
                         if buy["trade_date"] and sell["trade_date"] else None})
             row.update(closed_lot(buy, sell, qty))
-            if not buy["commission_complete"] or not sell["commission_complete"]:
+            if not buy["cost_complete"] or not sell["cost_complete"]:
                 row["realized_net"] = row["realized_pct"] = None
                 if not buy["commission_complete"]:
                     row["buy_commission"] = None
@@ -506,14 +654,15 @@ class PortfolioService:
             row["last_price"] = price
             current_fx = valuations[position["id"]]["fx_to_usd"] if position else buy["fx_to_usd"]
             row.update(open_lot(buy, qty, price, current_fx))
-            if not buy["commission_complete"]:
+            if not buy["cost_complete"]:
                 row["net_unrealized"] = row["unrealized_pct"] = None
-                row["buy_commission"] = None
+                if not buy['commission_complete']:
+                    row["buy_commission"] = None
                 row["lot_note"] = "Fee pending"
             if reconciliation.get(buy["position_id"]) == "DIFFERENCE":
                 row["net_unrealized"] = None
                 row["lot_note"] = "IBKR qty differs"
-            elif buy["commission_complete"]:
+            elif buy["cost_complete"]:
                 price_source = valuations[position["id"]]["price_source"] if position else ""
                 row["lot_note"] = (price_source if row.get("net_unrealized") is not None and
                                    price_source.startswith(("SAVED SESSION BAR", "CACHED CLOSE", "CACHED QUOTE")) else
@@ -525,6 +674,10 @@ class PortfolioService:
                 returns = historical_returns(price, history, self._as_of(position))
                 row["mtd"], row["ytd"] = returns["mtd"], returns["ytd"]
             rows.append(row)
+        for row in rows:
+            buy = trades[row["buy_trade_id"]]
+            row["raw_display_ticker"] = buy["display_ticker"]
+            row["ticker"] = names.trade(buy)
         return rows
 
     @staticmethod

@@ -83,9 +83,12 @@ class HelpVisual(QWidget):
             caption = "Overview tabs, filters and table · example"
         elif kind == "analytics":
             content.addLayout(_row(("P&L", "TabSelected", 0),
+                                   ("Returns", "Tab", 0),
                                    ("Capital deployment", "Tab", 0), ("Exposure", "Tab", 1)))
             content.addLayout(_row(("Range", "Status", 0), ("3 months", "Control", 0),
                                    ("Chart", "Status", 0), ("Adjusted NAV change", "Control", 1)))
+            content.addLayout(_row(("Daily move", "Status", 0), ("Max USD gain", "Control", 1),
+                                   ("Sharpe ratio", "Header", 0), ("—", "Cell", 0)))
             self.chart = _ExampleChart(theme)
             content.addWidget(self.chart)
             content.addLayout(_row(("Chart and table", "Status", 0),

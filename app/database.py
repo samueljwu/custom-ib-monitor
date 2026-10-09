@@ -9,7 +9,8 @@ from contextlib import closing
 from datetime import date, datetime
 from pathlib import Path
 
-from app.paths import default_data_dir, local_config_path, user_data_dir
+from app.paths import (default_data_dir, select_data_directory,
+                       selected_data_directory, validate_database_path, validate_data_directory)
 
 
 DEFAULTS = {
@@ -24,25 +25,25 @@ POSITION_FIELDS = ("display_ticker", "ib_symbol", "security_type", "exchange", "
                    "currency", "local_symbol", "expiry", "option_right", "strike", "trading_class",
                    "multiplier", "position_qty", "average_cost", "fx_to_usd", "notes")
 TRADE_FIELDS = ("trade_id", "trade_date", "display_ticker", "ib_symbol", "side", "quantity",
-                "price", "security_type", "multiplier", "currency", "fx_to_usd", "commission_usd", "notes")
+                "price", "security_type", "multiplier", "currency", "fx_to_usd", "commission_usd", "tax_lc", "tax_usd", "notes")
 
 
 class Database:
     def __init__(self, path=None):
-        config_path = local_config_path()
-        configured = ""
-        if path is None and config_path.exists():
-            try:
-                configured = json.loads(config_path.read_text(encoding="utf-8")).get("data_directory", "")
-            except (ValueError, OSError):
-                pass
-        self.path = Path(path or Path(configured or default_data_dir()) / "portfolio.sqlite3")
+        new_selection = path is None and selected_data_directory() is None
+        self.path = validate_database_path(path if path is not None else default_data_dir() / "portfolio.sqlite3")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(self.path, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.execute("PRAGMA busy_timeout=30000")
         self._init()
+        if new_selection:
+            try:
+                select_data_directory(self.path.parent)
+            except Exception:
+                self.conn.close()
+                raise
 
     def _init(self):
         self.conn.executescript("""
@@ -214,7 +215,9 @@ class Database:
             "position_id": "INTEGER",
             "source": "TEXT NOT NULL DEFAULT 'manual'",
             "executed_at": "TEXT NOT NULL DEFAULT ''",
-            "security_type": "TEXT NOT NULL DEFAULT 'STK'", "multiplier": "REAL DEFAULT 1"})
+            "security_type": "TEXT NOT NULL DEFAULT 'STK'", "multiplier": "REAL DEFAULT 1",
+            "tax_lc": "REAL DEFAULT 0", "tax_usd": "REAL DEFAULT 0"})
+        self._add_missing_columns("cash_reconciliations", {"trade_tax": "TEXT NOT NULL DEFAULT '0'"})
         self._add_missing_columns("trade_matches", {"origin": "TEXT NOT NULL DEFAULT 'manual'"})
         self._add_missing_columns("account_history", {"daily_pnl_usd": "REAL"})
         with self.conn:
@@ -254,6 +257,16 @@ class Database:
                     AND display_ticker=? AND position_id IS NULL""",
                     (position_id, row["portfolio_id"], row["display_ticker"]))
 
+        from app.trade_costs import upgrade_saved_trade_taxes
+        if 'tax_usd' in added_trades and self.conn.execute('SELECT 1 FROM trades LIMIT 1').fetchone():
+            self.backup()
+        with self.conn:
+            if 'tax_usd' in added_trades:
+                self.conn.execute('''UPDATE trades SET tax_lc=NULL,tax_usd=NULL
+                    WHERE source IN ('IBKR sync','IBKR Activity Statement') OR
+                    EXISTS (SELECT 1 FROM broker_executions e WHERE e.trade_row_id=trades.id)''')
+            upgrade_saved_trade_taxes(self)
+
     def _add_missing_columns(self, table, columns):
         existing = {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})")}
         added = set()
@@ -279,6 +292,7 @@ class Database:
                 row["raw_commission_usd"] = row["commission_usd"]
                 row["commission_refund_usd"] = refunds.get(row["id"], 0.0)
                 row["commission_usd"] -= row["commission_refund_usd"]
+                row["cost_complete"] = row["commission_complete"] and row["tax_usd"] is not None
             return raw
         if portfolio_id is not None:
             if table == "trade_matches":
@@ -294,6 +308,33 @@ class Database:
     def add_portfolio(self, name):
         with self.conn:
             return self.conn.execute("INSERT INTO portfolios(name) VALUES (?)", (name,)).lastrowid
+
+    def portfolio_name(self, portfolio_id):
+        row = self.conn.execute("SELECT name FROM portfolios WHERE id=?", (portfolio_id,)).fetchone()
+        if row is None:
+            raise ValueError("Unknown portfolio")
+        return row[0]
+
+    def validate_portfolio_name(self, portfolio_id, name):
+        self.portfolio_name(portfolio_id)
+        name = name.strip()
+        if not name:
+            raise ValueError("Enter a portfolio name")
+        if self.conn.execute("SELECT 1 FROM portfolios WHERE name=? AND id<>?",
+                             (name, portfolio_id)).fetchone():
+            raise ValueError("A portfolio with this name already exists in this database")
+        return name
+
+    def rename_portfolio(self, portfolio_id, name):
+        name = self.validate_portfolio_name(portfolio_id, name)
+        try:
+            with self.conn:
+                cur = self.conn.execute("UPDATE portfolios SET name=? WHERE id=?", (name, portfolio_id))
+                if cur.rowcount != 1:
+                    raise ValueError("Unknown portfolio")
+        except sqlite3.IntegrityError as exc:
+            raise ValueError("A portfolio with this name already exists in this database") from exc
+        return name
 
     def portfolio_nav(self, portfolio_id):
         row = self.conn.execute("SELECT nav_usd FROM portfolios WHERE id=?", (portfolio_id,)).fetchone()
@@ -661,7 +702,7 @@ class Database:
                                           (details[source], position_id))
 
     def backup(self, directory=None):
-        target_dir = Path(directory or self.setting("backup_directory") or self.path.parent / "backups")
+        target_dir = validate_data_directory(directory or self.setting("backup_directory") or self.path.parent / "backups")
         target_dir.mkdir(parents=True, exist_ok=True)
         target = target_dir / f"portfolio-{datetime.now():%Y%m%d-%H%M%S-%f}.sqlite3"
         destination = sqlite3.connect(target)
@@ -673,7 +714,7 @@ class Database:
 
     def configure_data_directory(self, directory):
         """Copy a quiescent database and select the verified copy for next launch."""
-        target_dir = Path(directory) if directory else user_data_dir()
+        target_dir = validate_data_directory(directory or self.path.parent)
         target_dir.mkdir(parents=True, exist_ok=True)
         target = target_dir / "portfolio.sqlite3"
         temporary = target_dir / f".portfolio-{uuid4().hex}.sqlite3"
@@ -691,14 +732,9 @@ class Database:
             except Exception:
                 temporary.unlink(missing_ok=True)
                 raise
-        config_path = local_config_path()
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_temp = config_path.with_name(f".{config_path.name}-{uuid4().hex}.tmp")
         try:
-            config_temp.write_text(json.dumps({"data_directory": str(target_dir)}), encoding="utf-8")
-            os.replace(config_temp, config_path)
+            select_data_directory(target_dir)
         except Exception:
-            config_temp.unlink(missing_ok=True)
             if created:
                 target.unlink(missing_ok=True)
             raise

@@ -1,6 +1,7 @@
 """Native portfolio monitor UI."""
 
 from datetime import date, datetime, timedelta
+from functools import partial
 from html import escape
 import json
 import math
@@ -10,17 +11,26 @@ import time
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from PySide6.QtCore import QAbstractTableModel, QByteArray, QItemSelectionModel, QModelIndex, QTimer, Qt
-from PySide6.QtGui import QAction, QActionGroup, QColor, QKeySequence, QShortcut
+from PySide6.QtCore import QAbstractTableModel, QByteArray, QItemSelectionModel, QModelIndex, QSize, QTimer, Qt, QUrl
+from PySide6.QtGui import QAction, QActionGroup, QColor, QDesktopServices, QKeySequence, QShortcut
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-                               QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView,
+                               QDoubleSpinBox, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QHeaderView,
                                QGridLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QTabWidget,
                                QScrollArea, QSizePolicy, QStackedWidget, QStyle, QStyledItemDelegate,
                                QStyleOptionViewItem, QTableView, QVBoxLayout, QWidget)
 
 from app.database import Database
-from app.paths import user_data_dir
+from app.activity_statement_trades import (import_activity_statement_trades,
+                                           preview_activity_statement_trades)
+from app.instrument_names import InstrumentNames
+from app.paths import data_root, validate_data_directory
+from app.secret_store import save_flex_token
+from app.sync_service import trade_sync_paused
+from app.sync_timing import SyncTiming, duration_text, history_remaining
 from app.diagnostics import configure_diagnostics, diagnostic_log_path
+from app.history_status import (format_history_details, format_history_summary, process_alive,
+                                pause_request_path, read_status, status_path, write_status,
+                                current_history_result, reconciliation_status)
 from app.calculations import choose_price, valid_price
 from app.analytics_ui import AnalyticsTab
 from app.cash_ui import CashMovementsTab
@@ -29,11 +39,14 @@ from app.broker_sync import BrokerIngestor
 from app.excel_io import export_workbook
 from app.market_data import IBKRMarketDataProvider, MarketDataProvider, MockMarketDataProvider
 from app.services import PortfolioService
-from app.table_ui import InputReportTable, ReportTable, SortItem, handle_table_shortcut
+from app.table_ui import InputReportTable, ReportTable, SortItem, fit_option_name_column, handle_table_shortcut
 from app.ui_theme import (COLORS, TOOLBAR_GROUP_SPACING, TOOLBAR_ITEM_SPACING,
-                          stylesheet, style_toolbar_dropdown)
+                          stylesheet, status_link, style_toolbar_dropdown)
 from app.themed_checkbox import ThemedCheckBox
 from app.help_visuals import HelpVisual
+from app.header_icons import header_icon
+from app.settings_ui import SettingsSection, SettingsStatus
+from app.clipboard_ui import add_table_copy_actions, install_clipboard_support
 
 
 def col(key, label, kind="text"):
@@ -48,7 +61,8 @@ PORTFOLIO = [
     col("display_ticker", "Instrument"), col("position_qty", "Quantity", "number"),
     col("average_cost", "Open cost", "price"), col("last_px", "Last price", "price"),
     col("value", "Value USD", "money"), col("daily_pnl", "Daily P&L", "money"),
-    col("unrealized_pnl", "Open P&L", "money"), col("portfolio_pct", "Weight", "pct"),
+    col("unrealized_pnl", "Open P&L", "money"), col("unrealized_pct", "Open P&L %", "pct"),
+    col("portfolio_pct", "Weight", "pct"),
     col("one_day", "DTD", "pct"), col("mtd", "MTD", "pct"), col("ytd", "YTD", "pct"),
     col("reconciliation", "Reconciliation"), col("data_status", "Data status"),
     col("price_source", "Price source"), col("last_updated", "Updated"),
@@ -61,6 +75,14 @@ TRADES = [
     col("matched_qty", "Matched", "number"), col("remaining_qty", "Remaining", "number"),
     col("valuation_status", "Data status"), col("trade_id", "Reference"),
     col("source", "Origin"),
+    # Append logical columns so existing saved sort and header indices stay valid.
+    col("last_price", "Last price", "price"),
+    col("realized_net", "Realized P&L USD", "money"),
+    col("net_unrealized", "Open P&L USD", "money"),
+    col("price_source", "Price source"), col("pnl_note", "P&L status"),
+    col("realized_pct", "Realized P&L %", "pct"),
+    col("unrealized_pct", "Open P&L %", "pct"),
+    col("tax_usd", "Tax USD", "money"),
 ]
 LOTS = [
     col("lot_state", "Status"), col("ticker", "Instrument"), col("buy_date", "Bought", "date"),
@@ -71,6 +93,7 @@ LOTS = [
     col("lot_note", "Note"),
     col("buy_commission", "Buy fees", "money"), col("sell_commission", "Sell fees", "money"),
     col("duration", "Days held", "number"),
+    col("buy_tax", "Buy tax USD", "money"), col("sell_tax", "Sell tax USD", "money"),
 ]
 COLUMNS = {"Portfolio": PORTFOLIO, "Trades": TRADES, "Lots": LOTS}
 PRICE_MOVES = ("one_day", "mtd", "ytd")
@@ -112,14 +135,18 @@ class GridModel(QAbstractTableModel):
         self.sort_column = int(saved_sort.split(":")[0]) if saved_sort and saved_sort.split(":")[0].isdigit() else 0
         if name == "Portfolio":
             columns_version = self.db.setting("portfolio_columns_version")
-            if columns_version not in ("2", "3"):
+            if columns_version not in ("2", "3", "4"):
                 # The original layout had IBKR quantity at index 11.
                 self.sort_column = (1 if self.sort_column == 11 else
                                     self.sort_column - 1 if self.sort_column > 11 else self.sort_column)
-            if columns_version != "3":
+            if columns_version not in ("3", "4"):
                 # The next layout had Difference at index 11; Reconciliation takes its place.
                 if self.sort_column > 11:
                     self.sort_column -= 1
+            if columns_version != "4":
+                # Open P&L % is inserted before the former Weight column.
+                if self.sort_column >= 7:
+                    self.sort_column += 1
                 if saved_sort:
                     self.db.set_setting(f"sort_{name}",
                                         f"{self.sort_column}:{saved_sort.partition(':')[2] or 'asc'}")
@@ -130,11 +157,11 @@ class GridModel(QAbstractTableModel):
         self.beginResetModel()
         if all_rows is None:
             all_rows = (self.service.portfolio_rows() if self.name == "Portfolio" else
-                        self.service.matching.trade_rows() if self.name == "Trades" else
+                        self.service.trade_rows() if self.name == "Trades" else
                         self.service.lots_rows())
         needle = self.filter_text.casefold()
-        self.rows = [row for row in all_rows if not needle or needle in str(
-            row.get("display_ticker") or row.get("ticker") or "").casefold()]
+        self.rows = [row for row in all_rows if not needle or any(needle in str(row.get(key) or "").casefold()
+                     for key in ("display_ticker", "ticker", "raw_display_ticker", "local_symbol", "ib_symbol"))]
         if self.name == "Trades" and self.side_filter != "All":
             self.rows = [row for row in self.rows if row.get("side") == self.side_filter]
         if self.name == "Portfolio" and self.hide_closed:
@@ -230,6 +257,18 @@ class GridModel(QAbstractTableModel):
             return self.columns[section][1] if orientation == Qt.Horizontal else f"{section + 1:,}"
         if role == Qt.ToolTipRole and orientation == Qt.Horizontal:
             key = self.columns[section][0]
+            if self.name == "Trades" and key in ("realized_pct", "unrealized_pct"):
+                return ("Net P&L divided by the entry basis of matched or remaining quantity. "
+                        "Long basis is purchase cost including entry fees; short basis is opening proceeds after entry fees. "
+                        "Multiple matched lots use their combined basis. Non-positive or unavailable basis shows —.")
+            if self.name == "Trades" and key == "realized_net":
+                return ("Net P&L on matched quantities, after allocated entry and exit fees. "
+                        "Each matched gain appears on both its BUY and SELL; do not sum both sides.")
+            if self.name == "Trades" and key in ("net_unrealized", "last_price"):
+                return ("Open P&L values only remaining quantity, after allocated entry fees. "
+                        "Last price uses the current instrument valuation; Price source labels any close or cached fallback.")
+            if key == "unrealized_pct":
+                return "Open P&L divided by remaining purchase cost in USD, including allocated buy fees."
             if key in BAR_COLUMNS[self.name]:
                 metric = "Price return" if key in PRICE_MOVES else "Open P&L in USD"
                 return f"{metric}; bar length is scaled to the largest absolute value shown in this column."
@@ -242,6 +281,23 @@ class GridModel(QAbstractTableModel):
         row = self.rows[index.row()]
         value = row.get(key)
         if role == Qt.ToolTipRole:
+            if self.name == "Trades":
+                if key == "last_price":
+                    return row.get("last_price_note") or "Price unavailable"
+                if key in ("realized_pct", "unrealized_pct"):
+                    if value is None:
+                        return row.get(f"{key}_note") or "P&L percentage unavailable"
+                    return self.headerData(index.column(), Qt.Horizontal, Qt.ToolTipRole)
+                if key in ("realized_net", "net_unrealized"):
+                    note = row.get("realized_note" if key == "realized_net" else "open_note")
+                    if value is None:
+                        return note or "P&L unavailable"
+                    return ("Net P&L on this execution's matched quantity. The same gain appears on the other execution; do not sum both sides."
+                            if key == "realized_net" else
+                            "Open P&L on remaining quantity, after allocated entry fees. " + (row.get("last_price_note") or ""))
+            if key in ("display_ticker", "ticker"):
+                return "\n".join(dict.fromkeys(str(part) for part in
+                    (value, row.get("raw_display_ticker"), row.get("local_symbol")) if part))
             if row.get("security_type") == "CASH" and key in ("side", "quantity", "price", "gross_usd", "match_status"):
                 pair = str(row.get("display_ticker") or "").split(".")
                 if len(pair) == 2:
@@ -257,14 +313,15 @@ class GridModel(QAbstractTableModel):
             return {"gross_usd": "Gross trade value in USD, before commission.",
                     "realized_net": "Realized P&L in USD after allocated buy and sell commissions.",
                     "net_unrealized": "Open P&L in USD after allocated buy commission.",
+                    "unrealized_pct": "Open P&L divided by remaining purchase cost in USD, including allocated buy fees.",
                     "match_status": "BUY shares stay open until matched to a sale. SELL shares need eligible buys."}.get(key)
         if role in (Qt.DisplayRole, Qt.EditRole):
             if role == Qt.EditRole:
                 return "" if value is None else str(value)
             if value is None or value == "":
                 if value is None and key in (
-                    "gross_usd", "value", "daily_pnl", "unrealized_pnl", "portfolio_pct",
-                    "realized_net", "net_unrealized"):
+                    "gross_usd", "value", "daily_pnl", "unrealized_pnl", "unrealized_pct", "portfolio_pct",
+                    "realized_net", "net_unrealized", "last_price", "realized_pct"):
                     return "—"
                 return ""
             if kind == "pct":
@@ -280,7 +337,7 @@ class GridModel(QAbstractTableModel):
             return Qt.AlignRight | Qt.AlignVCenter if kind in ("money", "price", "number", "ratio", "pct") else Qt.AlignLeft | Qt.AlignVCenter
         if role == Qt.ForegroundRole:
             dark = self.theme == "dark"
-            if key in ("daily_pnl", "unrealized_pnl", "realized_net", "net_unrealized") and isinstance(value, (int, float)):
+            if key in ("daily_pnl", "unrealized_pnl", "unrealized_pct", "realized_net", "net_unrealized", "realized_pct") and isinstance(value, (int, float)):
                 return QColor(("#52c7a6" if dark else "#137333") if value > 0 else
                               ("#ff8b91" if dark else "#b3261e") if value < 0 else
                               ("#f0f0f2" if dark else "#30343b"))
@@ -406,7 +463,9 @@ class DisplayAmountSpinBox(QDoubleSpinBox):
 class MatchDialog(QDialog):
     def __init__(self, service, sell, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Match SELL {sell['trade_id']} — {sell['display_ticker']}")
+        name = (InstrumentNames(service.db, service.portfolio_id).trade(sell)
+                if sell.get("security_type") in {"OPT", "FOP"} else sell["display_ticker"])
+        self.setWindowTitle(f"Match SELL {sell['trade_id']} — {name}")
         self.resize(700, 350)
         self.inputs = []
         old_matches = {}
@@ -482,17 +541,19 @@ class MainWindow(QMainWindow):
     DEFAULT_TAB_ORDER = ("Portfolio", "Trades", "Lots", "Cash", "Analytics", "Rebalance")
     TAB_LAYOUT_KEY = "tab_layout_v1"
 
-    def __init__(self):
+    def __init__(self, database_path=None):
         super().__init__()
-        self.setWindowTitle("Portfolio Monitor")
+        install_clipboard_support()
         available = QApplication.primaryScreen().availableGeometry()
         self.resize(min(1450, max(640, available.width() - 40)),
                     min(850, max(480, available.height() - 40)))
-        self.db = Database()
+        self._database_path_override = database_path is not None
+        self.db = Database(database_path) if self._database_path_override else Database()
         self._pending_data_directory = None
         self.log = configure_diagnostics(self.db.path, "monitor")
         self.log.info("Portfolio Monitor opened; database=%s", self.db.path)
         self.portfolio_id = 1
+        self.setWindowTitle(f"Portfolio Monitor · {self.db.portfolio_name(self.portfolio_id)}")
         self._show_account_summary = self.db.setting("show_account_summary") != "0"
         self._history_attempt_day = None
         self._last_flex_sync_stamp = self.db.metadata("ibkr_flex_sync_completed")
@@ -500,14 +561,29 @@ class MainWindow(QMainWindow):
         self._sync_process = None
         self._analytics_process = None
         self._cash_process = None
+        self._history_process = None
+        self._history_status_path = status_path(self.db.path)
+        self._history_timer = QTimer(self)
+        self._history_timer.timeout.connect(self._check_history_import)
         self._last_analytics_sync_attempt = 0.0
         self._last_cash_sync_day = None
         self._sync_all_queue = []
         self._sync_all_active = False
+        self._sync_requested = False
         self._sync_progress_active = False
         self._live_sync_pending = False
         self._live_sync_events = set()
         self._live_sync_started_at = 0.0
+        try:
+            saved_timing = json.loads(self.db.metadata("sync_timing_v1") or "{}")
+        except (ValueError, TypeError):
+            saved_timing = {}
+        self._sync_timing = SyncTiming(saved_timing)
+        self._timed_sync_processes = {}
+        self._progress_started_at = None
+        self._progress_kind = None
+        self._progress_failed = False
+        self._progress_finished_at = None
         self._last_gateway_sync_request = None
         self._last_quote_cache_at = 0.0
         self._last_connection_attempt = 0.0
@@ -529,29 +605,43 @@ class MainWindow(QMainWindow):
         heading_row = QHBoxLayout()
         heading_row.addWidget(self.heading)
         heading_row.addStretch()
-        self.sync_button = QPushButton("Sync IBKR")
+        self.sync_button = QPushButton()
         self.sync_button.setObjectName("secondary")
-        self.sync_button.clicked.connect(self.sync_all)
+        self.sync_button.clicked.connect(self._request_sync)
         heading_row.addWidget(self.sync_button)
-        self.theme_button = QPushButton()
-        self.theme_button.setObjectName("themeToggle")
-        self.theme_button.setToolTip("Switch between light and dark mode")
-        self.theme_button.clicked.connect(self.toggle_theme)
-        heading_row.addWidget(self.theme_button)
-        self.help_button = QPushButton("Help")
+        self.history_control_button = QPushButton('Pause import')
+        self.history_control_button.setObjectName('secondary')
+        self.history_control_button.clicked.connect(self.control_history_import)
+        self.history_control_button.hide()
+        heading_row.addWidget(self.history_control_button)
+        self.help_button = QPushButton()
         self.help_button.setObjectName("secondary")
         self.help_button.clicked.connect(self.open_help)
         heading_row.addWidget(self.help_button)
-        settings_button = QPushButton("Settings")
-        settings_button.setObjectName("secondary")
-        settings_button.clicked.connect(self.open_settings)
-        heading_row.addWidget(settings_button)
+        self.settings_button = QPushButton()
+        self.settings_button.setObjectName("secondary")
+        self.settings_button.clicked.connect(self.open_settings)
+        heading_row.addWidget(self.settings_button)
+        self.theme_button = QPushButton()
+        self.theme_button.setObjectName("themeToggle")
+        self.theme_button.clicked.connect(self.toggle_theme)
+        heading_row.addWidget(self.theme_button)
+        for button, label in ((self.sync_button, "Sync IBKR"), (self.help_button, "Help"),
+                              (self.settings_button, "Settings"), (self.theme_button, "Dark mode")):
+            button.setProperty("headerIcon", True)
+            button.setFixedSize(32, 32)
+            button.setIconSize(QSize(18, 18))
+            button.setAccessibleName(label)
+            button.setToolTip(label)
+        self.sync_request_timer = QTimer(self)
+        self.sync_request_timer.setSingleShot(True)
+        self.sync_request_timer.timeout.connect(self._run_requested_sync)
         root_layout.addLayout(heading_row)
         summary = QWidget()
         summary.setObjectName("summary")
         self.summary = summary
         summary_layout = QVBoxLayout(summary)
-        summary_layout.setContentsMargins(14, 10, 14, 9)
+        summary_layout.setContentsMargins(14, 5, 14, 4)
         summary_layout.setSpacing(5)
         metrics = QGridLayout()
         metrics.setHorizontalSpacing(20)
@@ -596,14 +686,26 @@ class MainWindow(QMainWindow):
         self.sync_progress_bar.setFixedHeight(12)
         self.statusBar().addPermanentWidget(self.sync_progress_label)
         self.statusBar().addPermanentWidget(self.sync_progress_bar)
+        self.sync_time_label = QLabel()
+        self.sync_time_label.setObjectName("syncTimeLabel")
+        self.sync_time_label.setMinimumWidth(130)
+        self.sync_time_label.setToolTip("Estimated time for the remaining sync work; broker response times may vary.")
+        self.statusBar().addPermanentWidget(self.sync_time_label)
         self.trade_sync_status = QLabel()
         self.trade_sync_status.setObjectName("tradeSyncStatus")
         self.trade_sync_status.setTextFormat(Qt.RichText)
         self.trade_sync_status.setTextInteractionFlags(Qt.TextBrowserInteraction)
         self.trade_sync_status.linkActivated.connect(self.show_trade_sync_details)
         self.statusBar().addPermanentWidget(self.trade_sync_status)
+        self.history_status_label = QLabel()
+        self.history_status_label.setObjectName("historyStatus")
+        self.history_status_label.setTextFormat(Qt.RichText)
+        self.history_status_label.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        self.history_status_label.linkActivated.connect(self.show_history_import_details)
+        self.statusBar().addPermanentWidget(self.history_status_label)
         self.sync_progress_label.hide()
         self.sync_progress_bar.hide()
+        self.sync_time_label.hide()
         for name in COLUMNS:
             self._make_grid_tab(name)
         self.cash_tab = CashMovementsTab(self.db, self.portfolio_id)
@@ -625,11 +727,12 @@ class MainWindow(QMainWindow):
         self.previous_tab_shortcut = QShortcut(QKeySequence("Ctrl+Shift+Tab"), self)
         self.previous_tab_shortcut.setContext(Qt.WindowShortcut)
         self.previous_tab_shortcut.activated.connect(lambda: self._step_tab(-1))
-        self.help_shortcut = QShortcut(QKeySequence("F1"), self)
-        self.help_shortcut.setContext(Qt.ApplicationShortcut)
-        self.help_shortcut.activated.connect(self.open_help)
         self._restore_columns()
+        # A saved default view must not replace the user's latest dragged subtab order.
+        analytics_order = self.analytics_tab.section_order()
         self._restore_default_views()
+        self.analytics_tab._apply_section_order(analytics_order)
+        self.analytics_tab._save_section_order()
         self.restore_tab_layout()
         self._update_summary_visibility()
         self._apply_theme(self.db.setting("ui_theme") or "light")
@@ -639,7 +742,7 @@ class MainWindow(QMainWindow):
             self._watch_live_sync()
         self.lots_refresh_timer = QTimer(self)
         self.lots_refresh_timer.setSingleShot(True)
-        self.lots_refresh_timer.timeout.connect(lambda: self._refresh_model("Lots"))
+        self.lots_refresh_timer.timeout.connect(self._refresh_trade_lots)
         self.calcs_refresh_timer = QTimer(self)
         self.calcs_refresh_timer.setSingleShot(True)
         self.calcs_refresh_timer.timeout.connect(self._refresh_calcs_live)
@@ -655,6 +758,9 @@ class MainWindow(QMainWindow):
         self._update_status()
         self._queue_configured_syncs()
         self._update_sync_button()
+        self._update_history_status()
+        if self._history_running():
+            self._history_timer.start(1000)
 
     def _refresh_special_tab(self, index):
         widget = self.tabs.widget(index)
@@ -696,13 +802,20 @@ class MainWindow(QMainWindow):
         for visual in self.help_visuals:
             visual.set_theme(self.theme)
         self.analytics_tab.set_theme(self.theme)
-        self.calcs_tab.set_theme(self.theme)
-        self.theme_button.setText("Light mode" if self.theme == "dark" else "Dark mode")
+        for button, name in ((self.sync_button, "sync"), (self.help_button, "help"),
+                             (self.settings_button, "settings"),
+                             (self.theme_button, "sun" if self.theme == "dark" else "moon")):
+            button.setIcon(header_icon(name, self.theme))
+        theme_action = "Switch to light mode" if self.theme == "dark" else "Switch to dark mode"
+        self.theme_button.setAccessibleName(theme_action)
+        self.theme_button.setToolTip(theme_action)
         for model in self.models.values():
             model.theme = self.theme
             if model.rowCount() and model.columnCount():
                 model.dataChanged.emit(model.index(0, 0),
                                        model.index(model.rowCount() - 1, model.columnCount() - 1))
+        self._update_status()
+        self._update_history_status()
 
     def toggle_theme(self):
         theme = "light" if self.theme == "dark" else "dark"
@@ -711,6 +824,11 @@ class MainWindow(QMainWindow):
 
     def sync_all(self):
         """Refresh live IBKR state and start every configured Flex catch-up."""
+        if self._history_running():
+            QMessageBox.information(self, "Sync IBKR", "Historical import is running. Wait for it to finish before syncing.")
+            return
+        self.db.set_metadata('ibkr_flex_paused', '')
+        self._progress_failed = False
         self._sync_progress_active = True
         self._live_sync_pending = False
         self._live_sync_events.clear()
@@ -734,19 +852,37 @@ class MainWindow(QMainWindow):
                     ("analytics_flex_query_id", "Analytics Flex query", self._launch_analytics_sync),
                     ("cash_flex_query_id", "Cash Flex query", self._launch_cash_sync)):
                 if self.db.setting(key):
-                    self._sync_all_queue.append(launch)
+                    self._sync_all_queue.append(partial(launch, retry=True)
+                                                if key == "flex_query_id" else launch)
                 else:
                     missing.append(label)
         self._sync_all_active = bool(self._sync_all_queue)
         self._advance_sync_queue()
-        self.cash_tab.refresh()
-        self.analytics_tab.refresh()
         self._update_sync_button()
         if missing:
             self.statusBar().showMessage("Sync: configure " + ", ".join(missing) + " in Settings", 10000)
 
+    def _request_sync(self):
+        if self._sync_requested:
+            return
+        self._sync_requested = True
+        self._sync_progress_active = True
+        self._update_sync_button()
+        self.sync_button.repaint()
+        self.statusBar().repaint()
+        # Give Qt time to paint the disabled button and progress indicator
+        # before credential checks and worker startup.
+        self.sync_request_timer.start(0)
+
+    def _run_requested_sync(self):
+        try:
+            self.sync_all()
+        finally:
+            self._sync_requested = False
+            self._update_sync_button()
+
     def _queue_configured_syncs(self):
-        if not self.db.setting("ib_account_id"):
+        if not self.db.setting("ib_account_id") or self._history_running():
             return
         self._sync_all_queue = [launch for key, launch in (
             ("flex_query_id", self._launch_flex_sync),
@@ -756,7 +892,10 @@ class MainWindow(QMainWindow):
         self._advance_sync_queue()
 
     def _advance_sync_queue(self):
+        self._finish_timed_syncs()
         self._record_trade_sync_exit()
+        if self._history_running():
+            return
         if any(process is not None and process.poll() is None for process in
                (self._sync_process, self._analytics_process, self._cash_process)):
             return
@@ -775,9 +914,11 @@ class MainWindow(QMainWindow):
             self._sync_all_active = False
 
     def _update_sync_button(self):
-        running = self._live_sync_pending or self._sync_all_active or any(process is not None and process.poll() is None for process in
+        importing = self._history_running()
+        running = importing or self._sync_requested or self._live_sync_pending or self._sync_all_active or any(process is not None and process.poll() is None for process in
                       (self._sync_process, self._analytics_process, self._cash_process))
-        self.sync_button.setText("Syncing…" if running else "Sync IBKR")
+        sync_label = "Importing history…" if importing else "Syncing…" if running else "Sync IBKR"
+        self.sync_button.setAccessibleName(sync_label)
         self.sync_button.setEnabled(not running)
         statuses = []
         for label, setting, prefix in (
@@ -796,41 +937,290 @@ class MainWindow(QMainWindow):
                 statuses.append(f"{label}: {status}" + (f" · {completed}" if completed else "") +
                                 (f" · reconciled through {coverage}" if coverage else "") +
                                 (f" · {error[:120]}" if error else ""))
-        self.sync_button.setToolTip("Refresh live IBKR data and fetch completed Flex history.\n" +
+        self.sync_button.setToolTip(sync_label + "\nRefresh live IBKR data and fetch completed Flex history.\n" +
                                     "\n".join(statuses))
         self._update_sync_progress()
 
-    def _update_sync_progress(self):
+    def _update_sync_progress(self, history_status=None):
         if self._live_sync_pending and time.monotonic() - self._live_sync_started_at > 90:
             self._live_sync_pending = False
+            self._finish_live_sync(success=False)
+        self._finish_timed_syncs()
         running = [label for label, process in (
             ("Trades", self._sync_process), ("Analytics", self._analytics_process),
             ("Cash", self._cash_process)) if process is not None and process.poll() is None]
-        visible = self._sync_progress_active and (self._live_sync_pending or self._sync_all_active or bool(running))
-        if visible:
+        syncing = self._sync_progress_active and (self._sync_requested or self._live_sync_pending or self._sync_all_active or bool(running))
+        if history_status is None:
+            history_status = self._read_history_status()
+        importing = (history_status.get("state") in ("starting", "running") or
+                     (self._history_process is not None and self._history_process.poll() is None))
+        if importing:
+            source = history_status.get("active_source") or history_status.get("source")
+            stage = f"{source.title()} history" if source in ("trades", "analytics", "cash") else "history"
+            self.sync_progress_label.setText('Pausing after current report…' if history_status.get('pause_requested')
+                                             else f"Importing {stage}…")
+        elif syncing:
             stage = ("live IBKR data" if self._live_sync_pending else
                      f"{running[0]} history" if running else "IBKR history")
             self.sync_progress_label.setText(f"Syncing {stage}…")
         else:
             self._sync_progress_active = False
-        self.sync_progress_label.setVisible(visible)
-        self.sync_progress_bar.setVisible(visible)
+        self.sync_progress_label.setVisible(syncing or importing)
+        self.sync_progress_bar.setVisible(syncing or importing)
+        self._update_sync_time(syncing, importing, running, history_status)
+
+    def _sync_timing_key(self, stage):
+        query_key = {"Trades": "flex_query_id", "Analytics": "analytics_flex_query_id",
+                     "Cash": "cash_flex_query_id"}.get(stage)
+        query = self.db.setting(query_key) if query_key else self.db.setting("ib_host")
+        return json.dumps([stage, self.db.setting("ib_account_id"), query])
+
+    def _start_timed_sync(self, stage, process):
+        key = self._sync_timing_key(stage)
+        self._timed_sync_processes[stage] = (process, key)
+        self._sync_timing.start(key, time.monotonic())
+
+    def _save_sync_timing(self):
+        self.db.set_metadata("sync_timing_v1", json.dumps(self._sync_timing.durations))
+
+    def _finish_timed_syncs(self):
+        for stage, (process, key) in list(self._timed_sync_processes.items()):
+            code = process.poll()
+            if code is None:
+                continue
+            del self._timed_sync_processes[stage]
+            self._sync_timing.finish(key, time.monotonic(), success=code == 0)
+            self._progress_failed |= code != 0
+            if code == 0:
+                self._save_sync_timing()
+
+    def _finish_live_sync(self, *, success):
+        key = getattr(self, "_live_timing_key", None)
+        if key is not None:
+            self._sync_timing.finish(key, time.monotonic(), success=success)
+            self._live_timing_key = None
+            self._progress_failed |= not success
+            if success:
+                self._save_sync_timing()
+
+    def _update_sync_time(self, syncing, importing, running, status):
+        now = time.monotonic()
+        if syncing or importing:
+            kind = "history" if importing else "sync"
+            if self._progress_started_at is None or self._progress_kind != kind:
+                elapsed = 0
+                if importing:
+                    try:
+                        elapsed = max(0, (datetime.now() - datetime.fromisoformat(status["started_at"])).total_seconds())
+                    except (KeyError, TypeError, ValueError):
+                        pass
+                self._progress_started_at = now - elapsed
+                self._progress_kind = kind
+                self._progress_finished_at = None
+            if importing:
+                text = ('Finishing current report…' if status.get('pause_requested')
+                        else history_remaining(status, datetime.now()))
+            else:
+                queued = []
+                stages = {"_launch_flex_sync": "Trades", "_launch_analytics_sync": "Analytics",
+                          "_launch_cash_sync": "Cash"}
+                for launch in self._sync_all_queue:
+                    function = launch.func if isinstance(launch, partial) else launch
+                    stage = stages.get(getattr(function, "__name__", ""))
+                    if stage:
+                        queued.append(stage)
+                text = self._sync_timing.estimate(
+                    getattr(self, "_live_timing_key", None) if self._live_sync_pending else None,
+                    [self._sync_timing_key(stage) for stage in running + queued], now)
+            self.sync_time_label.setText(text)
+            self.sync_time_label.setMinimumWidth(max(130, self.sync_time_label.sizeHint().width()))
+            self.sync_time_label.show()
+        elif self._progress_started_at is not None:
+            elapsed = now - self._progress_started_at
+            if self._progress_kind == "history":
+                state = status.get("state", "failed")
+                source = status.get("source")
+                operation = (f"{source.title()} history import" if source in ("trades", "analytics", "cash")
+                             else "History import")
+                try:
+                    elapsed = max(0, (datetime.fromisoformat(status["finished_at"]) -
+                                      datetime.fromisoformat(status["started_at"])).total_seconds())
+                except (KeyError, TypeError, ValueError):
+                    pass
+                outcome = ("completed in" if state.startswith("completed") else
+                           "paused after" if state == "paused" else "failed after")
+            else:
+                operation = "IBKR sync"
+                outcome = "stopped after" if self._progress_failed else "completed in"
+            self.sync_time_label.setText(f"{operation} {outcome} {duration_text(elapsed)}")
+            self.sync_time_label.setMinimumWidth(max(130, self.sync_time_label.sizeHint().width()))
+            self._progress_started_at = None
+            self._progress_finished_at = now
+            self._progress_failed = False
+        elif self._progress_finished_at is None or now - self._progress_finished_at >= 10:
+            self.sync_time_label.hide()
 
     def _watch_live_sync(self):
         self._live_sync_pending = True
         self._live_sync_events.clear()
         self._live_sync_started_at = time.monotonic()
+        self._live_timing_key = self._sync_timing_key("Live")
+        self._sync_timing.start(self._live_timing_key, self._live_sync_started_at)
+
+    def _history_running(self):
+        if self._history_process is not None and self._history_process.poll() is None:
+            return True
+        return self._read_history_status().get("state") in ("starting", "running")
+
+    def _read_history_status(self):
+        status = read_status(self._history_status_path)
+        if status.get('state') in ('starting', 'running') and pause_request_path(self._history_status_path).exists():
+            status['pause_requested'] = True
+        if status.get("state") not in ("starting", "running"):
+            return status
+        if self._history_process is not None and self._history_process.poll() is None:
+            return status
+        pid = status.get("pid")
+        if pid and process_alive(pid):
+            return status
+        if status.get("state") == "starting" and not pid:
+            try:
+                started = datetime.fromisoformat(status["started_at"])
+                if datetime.now() - started < timedelta(seconds=30):
+                    return status
+            except (KeyError, ValueError, TypeError):
+                pass
+        # The worker may have published its result between our initial read
+        # and the process check. Read again after confirming it has exited.
+        status = read_status(self._history_status_path)
+        if status.get("state") not in ("starting", "running"):
+            return status
+        status.update(state="failed", pid=None,
+                      message=("Import stopped before reporting a result. Diagnostic log: "
+                               f"{diagnostic_log_path(self.db.path, 'history-import')}"),
+                      finished_at=datetime.now().isoformat(timespec="seconds"))
+        try:
+            write_status(self._history_status_path, status)
+        except OSError as exc:
+            self.log.error("Could not record interrupted history import: %s", exc)
+        return status
+
+    def _update_history_status(self):
+        status = self._read_history_status()
+        self._update_history_controls(status)
+        self._update_older_trades_button(status)
+        state = status.get("state")
+        if state:
+            label = 'pausing' if status.get('pause_requested') else state.replace('_', ' ')
+            self.history_status_label.setText(status_link(
+                self.theme, "history", f'History: {label}'))
+            self.history_status_label.setToolTip("Click for the latest historical import result")
+            self.history_status_label.setCursor(Qt.PointingHandCursor)
+        else:
+            self.history_status_label.clear()
+            self.history_status_label.setToolTip("")
+            self.history_status_label.unsetCursor()
+        self._update_sync_progress(status)
+
+    def _update_older_trades_button(self, status):
+        button = getattr(self, "older_trades_button", None)
+        if button is None:
+            return
+        outside_trades = (status.get("outside_history_windows") or {}).get("trades") or []
+        diagnosed = (status.get("state") not in (None, "starting", "running") and
+                     bool(outside_trades) and
+                     status.get("account_id") == self.db.setting("ib_account_id").strip())
+        button.setVisible(diagnosed)
+
+    def _update_history_controls(self, status):
+        importing = status.get('state') in ('starting', 'running') or (
+            self._history_process is not None and self._history_process.poll() is None)
+        resumable = status.get('state') == 'paused' and status.get('paused_by_user')
+        pausing = importing and status.get('pause_requested')
+        for name in ('history_control_button', 'settings_history_control_button'):
+            button = getattr(self, name, None)
+            if button is None:
+                continue
+            button.setVisible(bool(importing or resumable))
+            button.setText('Pausing…' if pausing else 'Pause import' if importing else 'Resume import')
+            button.setEnabled(bool(status.get('pause_supported') and not pausing) if importing
+                              else bool(resumable and not self._flex_sync_running()))
+            button.setToolTip('Finish and save the current report, then pause.' if importing and status.get('pause_supported')
+                              else 'This running worker predates pause support. Restart the app after it finishes.' if importing
+                              else 'Continue the same source and date range, skipping saved history.')
+
+    def control_history_import(self):
+        if self._history_running():
+            self.pause_history_import()
+        else:
+            self.resume_history_import()
+
+    def pause_history_import(self):
+        status = self._read_history_status()
+        if not self._history_running() or not status.get('pause_supported'):
+            return
+        try:
+            pause_request_path(self._history_status_path).touch()
+        except OSError as exc:
+            QMessageBox.warning(self, 'Pause import', f'Could not request pause: {exc}')
+            return
+        self._update_history_status()
+        self.statusBar().showMessage('Pausing after the current report is saved.', 10000)
+
+    def resume_history_import(self):
+        status = self._read_history_status()
+        if status.get('state') != 'paused' or not status.get('paused_by_user'):
+            return
+        if status.get('account_id') != self.db.setting('ib_account_id'):
+            QMessageBox.warning(self, 'Resume import', 'The IBKR account changed. Start a new import for this account.')
+            return
+        try:
+            start, end = date.fromisoformat(status['from_date']), date.fromisoformat(status['to_date'])
+            source = status['source']
+            if source not in ('all', 'trades', 'analytics', 'cash') or start > end or end >= date.today():
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            QMessageBox.warning(self, 'Resume import', 'The saved date range is invalid. Start a new import.')
+            return
+        self._start_history_import(source, start, end)
+
+    def show_history_import_details(self, _link=None):
+        status = self._read_history_status()
+        if not status:
+            return
+        status = current_history_result(self.db, status, self.portfolio_id)
+        box = QMessageBox(self)
+        title, summary = format_history_summary(status)
+        box.setWindowTitle("History import result")
+        box.setIcon(QMessageBox.Warning if status.get("state") == "failed" else QMessageBox.Information)
+        box.setTextFormat(Qt.PlainText)
+        box.setText(title)
+        box.setInformativeText(summary)
+        details = format_history_details(status)
+        box.setDetailedText(details)
+        box.setStandardButtons(QMessageBox.Ok)
+        if status.get('reconciliation_guidance'):
+            copy = box.addButton('Copy diagnostics', QMessageBox.ActionRole)
+            copy.clicked.connect(lambda: QApplication.clipboard().setText(details))
+        box.exec()
+
+    def _flex_sync_running(self):
+        return self._sync_all_active or any(
+            process is not None and process.poll() is None for process in
+            (self._sync_process, self._analytics_process, self._cash_process))
 
     def _update_account_heading(self):
         account = self.db.setting("ib_account_id")
         self.heading.setText(account or "Account not set")
 
-    def _sync_launch(self, module, flag):
-        if getattr(sys, "frozen", False):
-            return [sys.executable, flag, str(self.db.path)], self.db.path.parent
+    def _sync_launch(self, module):
         return [sys.executable, "-m", module, str(self.db.path)], Path(__file__).resolve().parent.parent
 
-    def _launch_flex_sync(self, *, manual=False):
+    def _launch_flex_sync(self, *, manual=False, retry=False):
+        if self._history_running():
+            return
+        if trade_sync_paused(self.db) and not retry:
+            return
         if not self.db.setting("ib_account_id") or not self.db.setting("flex_query_id"):
             if manual:
                 QMessageBox.warning(self, "IBKR trade sync", "Set the IBKR account and Flex query ID in Settings first.")
@@ -844,21 +1234,24 @@ class MainWindow(QMainWindow):
         try:
             self.db.set_metadata("ibkr_flex_sync_status", "starting")
             self.db.set_metadata("ibkr_flex_sync_error", "")
+            self.db.set_metadata("ibkr_flex_sync_error_code", "")
             self.db.set_metadata("ibkr_flex_sync_stage", "")
             self.db.set_metadata("ibkr_flex_sync_run_id", "")
             self.db.set_metadata("ibkr_flex_sync_started", now.isoformat(timespec="seconds"))
-            command, workdir = self._sync_launch("scripts.sync_trades", "--sync-trades")
+            command, workdir = self._sync_launch("scripts.sync_trades")
             self.log.info("Launching trade sync; manual=%s", manual)
             self._sync_process = subprocess.Popen(
                 command,
                 cwd=workdir,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._start_timed_sync("Trades", self._sync_process)
             if not manual:
                 self._last_gateway_sync_request = now
         except OSError as exc:
             self.db.set_metadata("ibkr_flex_sync_status", "failed")
             self.db.set_metadata("ibkr_flex_sync_error", str(exc))
+            self._progress_failed = True
             self.db.set_metadata("ibkr_flex_sync_stage", "launching sync process")
             self.db.set_metadata("ibkr_flex_sync_failed_at", datetime.now().isoformat(timespec="seconds"))
             self.log.error("Trade sync launch failed: %s: %s", type(exc).__name__, exc)
@@ -880,16 +1273,13 @@ class MainWindow(QMainWindow):
             self.log.error("Trade sync process failed without a recorded sync error; exit code %s", code)
 
     def _trade_flex_display_status(self):
-        status = self.db.metadata("ibkr_flex_sync_status") or "never"
-        if (status == "failed" and self.db.metadata("ibkr_flex_sync_stage") == "requesting Flex report"
-                and self.db.metadata("ibkr_flex_sync_error").startswith("Flex error 1003:")):
-            return "statement pending"
-        return status
+        if trade_sync_paused(self.db):
+            return "paused"
+        return self.db.metadata("ibkr_flex_sync_status") or "never"
 
     def show_trade_sync_details(self, _link=""):
         if self.db.metadata("ibkr_flex_sync_status") != "failed":
             return
-        pending = self._trade_flex_display_status() == "statement pending"
         run_id = self.db.metadata("ibkr_flex_sync_run_id")
         if run_id and run_id.isdigit():
             row = self.db.conn.execute("""SELECT id, started_at, finished_at, from_day, to_day, error
@@ -904,17 +1294,23 @@ class MainWindow(QMainWindow):
         stage = self.db.metadata("ibkr_flex_sync_stage") or "Unknown"
         failed_at = self.db.metadata("ibkr_flex_sync_failed_at") or (row["finished_at"] if row else "Unknown")
         window = (f"{row['from_day']} to {row['to_day']}" if row and row["from_day"] else "Not recorded")
-        details = (f"{'IBKR response' if pending else 'Error'}: {error or 'No error was recorded.'}\n"
-                   f"{'Checked at' if pending else 'Failed at'}: {failed_at}\nStage: {stage}\nDate window: {window}\n"
+        details = (f"Error: {error or 'No error was recorded.'}\n"
+                   f"Failed at: {failed_at}\nStage: {stage}\nDate window: {window}\n"
                    f"Run ID: {row['id'] if row else 'Not recorded'}\n"
                    f"Last successful sync: {self.db.metadata('ibkr_flex_sync_completed') or 'Never'}\n\n"
                    f"Diagnostic log: {diagnostic_log_path(self.db.path, 'sync-trades')}")
-        if pending:
-            QMessageBox.information(self, "IBKR trade statement pending", details)
-        else:
-            QMessageBox.warning(self, "IBKR trade sync failed", details)
+        if trade_sync_paused(self.db):
+            code = self.db.metadata('ibkr_flex_paused') or '1025'
+            details += (f"\n\nAutomatic Flex requests are paused after IBKR error {code}. "
+                        "Check the configured Flex queries and token in Client Portal. "
+                        "Then click Sync IBKR or run Import history to retry.")
+        QMessageBox.warning(self, "IBKR trade sync failed", details)
 
     def _launch_analytics_sync(self, *, manual=False):
+        if self._history_running():
+            return
+        if self.db.metadata('ibkr_flex_paused') not in ('', '1003'):
+            return
         if not self.db.setting("ib_account_id") or not self.db.setting("analytics_flex_query_id"):
             if manual:
                 QMessageBox.warning(self, "Analytics history", "Set the IBKR account and Analytics Flex query ID in Settings first.")
@@ -927,20 +1323,26 @@ class MainWindow(QMainWindow):
         try:
             self.db.set_metadata("ibkr_analytics_sync_status", "starting")
             self.db.set_metadata("ibkr_analytics_sync_error", "")
-            command, workdir = self._sync_launch("scripts.sync_analytics", "--sync-analytics")
+            command, workdir = self._sync_launch("scripts.sync_analytics")
             self.log.info("Launching analytics history sync; manual=%s", manual)
             self._analytics_process = subprocess.Popen(
                 command,
                 cwd=workdir,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._start_timed_sync("Analytics", self._analytics_process)
             self.analytics_tab.refresh()
         except OSError as exc:
             self.db.set_metadata("ibkr_analytics_sync_status", "failed")
             self.db.set_metadata("ibkr_analytics_sync_error", str(exc))
+            self._progress_failed = True
             self.log.error("Analytics history sync launch failed: %s: %s", type(exc).__name__, exc)
 
     def _launch_cash_sync(self, *, manual=False):
+        if self._history_running():
+            return
+        if self.db.metadata('ibkr_flex_paused') not in ('', '1003'):
+            return
         if not self.db.setting("ib_account_id") or not self.db.setting("cash_flex_query_id"):
             if manual:
                 QMessageBox.warning(self, "Cash history", "Set the IBKR account and Cash Flex query ID in Settings first.")
@@ -954,16 +1356,18 @@ class MainWindow(QMainWindow):
         try:
             self.db.set_metadata("ibkr_cash_sync_status", "starting")
             self.db.set_metadata("ibkr_cash_sync_error", "")
-            command, workdir = self._sync_launch("scripts.sync_cash", "--sync-cash")
+            command, workdir = self._sync_launch("scripts.sync_cash")
             self.log.info("Launching cash history sync; manual=%s", manual)
             self._cash_process = subprocess.Popen(
                 command,
                 cwd=workdir,
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            self._start_timed_sync("Cash", self._cash_process)
         except OSError as exc:
             self.db.set_metadata("ibkr_cash_sync_status", "failed")
             self.db.set_metadata("ibkr_cash_sync_error", str(exc))
+            self._progress_failed = True
             self.log.error("Cash history sync launch failed: %s: %s", type(exc).__name__, exc)
 
     def _make_grid_tab(self, name):
@@ -1066,14 +1470,36 @@ class MainWindow(QMainWindow):
         page = QWidget()
         page.setObjectName("settingsPage")
         layout = QVBoxLayout(page)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(12)
+        self.settings_status = SettingsStatus()
+        connection = QFrame()
+        connection.setObjectName("settingsSection")
+        connection_layout = QVBoxLayout(connection)
+        connection_layout.setContentsMargins(16, 14, 16, 14)
+        connection_layout.setSpacing(14)
+        heading_row = QHBoxLayout()
+        heading = QLabel("Connection")
+        heading.setObjectName("settingsHeading")
+        heading_row.addWidget(heading)
+        heading_row.addStretch()
+        self.settings_status.summary.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        heading_row.addWidget(self.settings_status.summary, 1)
+        connection_layout.addLayout(heading_row)
         form = QFormLayout()
+        form.setVerticalSpacing(10)
         advanced_form = QFormLayout()
+        advanced_form.setVerticalSpacing(10)
+        history_form = QFormLayout()
+        history_form.setVerticalSpacing(10)
+        storage_form = QFormLayout()
         self.settings_fields = {}
         definitions = [
-            ("provider", "Market provider", ["Mock", "IBKR"]),
-            ("ib_host", "IBKR host", None), ("ib_port", "IBKR port", None),
-            ("ib_client_id", "IBKR client ID", None),
-            ("ib_account_id", "IBKR account", None),
+            ("portfolio_name", "Portfolio name", None),
+            ("provider", "Data source", ["IBKR", "Demo"]),
+            ("ib_account_id", "Account", None),
+            ("ib_host", "Host", None), ("ib_port", "Port", None),
+            ("ib_client_id", "Client ID", None),
             ("flex_query_id", "Trades Flex query ID", None),
             ("analytics_flex_query_id", "Analytics Flex query ID", None),
             ("cash_flex_query_id", "Cash Flex query ID", None),
@@ -1083,43 +1509,66 @@ class MainWindow(QMainWindow):
             ("backup_directory", "Backup directory", None),
         ]
         for key, label, options in definitions:
+            stored = (self.db.portfolio_name(self.portfolio_id) if key == "portfolio_name"
+                      else self.db.setting(key))
             if options:
                 widget = QComboBox()
                 widget.addItems(options)
-                stored = self.db.setting(key)
-                widget.setCurrentText("On" if key == "autosave" and stored == "1" else
-                                      "Off" if key == "autosave" else stored)
+                widget.setCurrentText("Demo" if key == "provider" and stored == "Mock" else stored)
             else:
-                stored = self.db.setting(key)
                 widget = QLineEdit("" if stored is None else str(stored))
             self.settings_fields[key] = widget
-            target = advanced_form if key in (
-                "provider", "ib_client_id", "data_mode", "refresh_seconds",
-                "data_directory", "backup_directory") else form
+            widget.setAccessibleName(label)
+            if key in ("portfolio_name", "provider", "ib_account_id"):
+                target = form
+            elif key in ("flex_query_id", "analytics_flex_query_id", "cash_flex_query_id"):
+                target = history_form
+            elif key in ("data_directory", "backup_directory"):
+                target = storage_form
+            else:
+                target = advanced_form
             target.addRow(label, widget)
-        layout.addLayout(form)
-        self.use_ibkr_button = QPushButton("Use IBKR")
-        self.use_ibkr_button.clicked.connect(self._use_ibkr)
-        self.use_ibkr_button.setVisible(self.db.setting("provider") != "IBKR")
-        layout.addWidget(self.use_ibkr_button)
-        self.advanced_button = QPushButton("Advanced settings")
-        self.advanced_button.setObjectName("secondary")
-        layout.addWidget(self.advanced_button)
-        self.advanced_settings = QWidget()
-        self.advanced_settings.setLayout(advanced_form)
-        self.advanced_settings.hide()
-        self.advanced_button.clicked.connect(
-            lambda: self.advanced_settings.setVisible(not self.advanced_settings.isVisible()))
-        layout.addWidget(self.advanced_settings)
+        connection_layout.addLayout(form)
+        connection_layout.addWidget(self.settings_status.warning)
+        layout.addWidget(connection)
+        self.settings_fields["data_directory"].setToolTip(f"Choose a portfolio subfolder within {data_root()}")
+        self.settings_fields["backup_directory"].setToolTip(f"Backups must also stay in a subfolder within {data_root()}")
+        if self._database_path_override:
+            self.settings_fields["data_directory"].setText(str(self.db.path.parent))
+            self.settings_fields["data_directory"].setReadOnly(True)
+            self.settings_fields["data_directory"].setToolTip("Selected by --database for this launch")
+        self.connection_options = SettingsSection("Connection options")
+        self.connection_options.content_layout.addLayout(advanced_form)
+        self.advanced_button = self.connection_options.toggle
+        self.advanced_settings = self.connection_options.content
+        layout.addWidget(self.connection_options)
+        history = self.settings_status.history_section.content_layout
+        history.insertLayout(0, history_form)
         row = QHBoxLayout()
-        self._button(row, "Apply Settings", self.apply_settings)
+        self._button(row, "Save Flex token", self.save_flex_token).setObjectName("secondary")
+        self._button(row, "Import history", self.import_history).setObjectName("secondary")
+        self.older_trades_button = self._button(row, "Import older trades…", self.import_older_statement_trades)
+        self.older_trades_button.setObjectName("secondary")
+        self.older_trades_button.setToolTip(
+            "Import English IBKR Activity Statement CSV trades older than Flex history")
+        self.older_trades_button.hide()
+        self.settings_history_control_button = self._button(row, 'Pause import', self.control_history_import)
+        self.settings_history_control_button.setObjectName("secondary")
+        self.settings_history_control_button.hide()
         row.addStretch()
-        layout.addLayout(row)
-        self.settings_info = QLabel()
-        self.settings_info.setObjectName("settingsInfo")
-        self.settings_info.setWordWrap(True)
-        self.settings_info.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
-        layout.addWidget(self.settings_info)
+        history.insertLayout(1, row)
+        hint = QLabel("Save settings before saving a token or importing history.")
+        hint.setObjectName("settingsKey")
+        hint.setWordWrap(True)
+        history.insertWidget(2, hint)
+        diagnostics = self.settings_status.diagnostics_section.content_layout
+        storage_heading = QLabel("Storage")
+        storage_heading.setObjectName("settingsHeading")
+        diagnostics.addWidget(storage_heading)
+        diagnostics.addLayout(storage_form)
+        self.settings_history = self.settings_status.history_details
+        self.settings_info = self.settings_status.technical_details
+        layout.addWidget(self.settings_status)
         layout.addStretch()
         scroller = QScrollArea()
         scroller.setObjectName("settingsScroll")
@@ -1128,21 +1577,254 @@ class MainWindow(QMainWindow):
         scroller.setWidget(page)
         self.settings_dialog = QDialog(self)
         self.settings_dialog.setWindowTitle("Settings")
-        self.settings_dialog.resize(620, 650)
+        self.settings_dialog.resize(620, 440)
         dialog_layout = QVBoxLayout(self.settings_dialog)
         dialog_layout.addWidget(scroller)
-        close_button = QDialogButtonBox(QDialogButtonBox.Close)
-        close_button.rejected.connect(self.settings_dialog.reject)
-        dialog_layout.addWidget(close_button)
+        footer = QHBoxLayout()
+        footer.setContentsMargins(8, 4, 8, 4)
+        footer.addStretch()
+        close_button = self._button(footer, "Close", self.settings_dialog.reject)
+        close_button.setObjectName("secondary")
+        close_button.setAutoDefault(False)
+        self.save_settings_button = self._button(footer, "Save settings", self.apply_settings)
+        self.save_settings_button.setDefault(True)
+        dialog_layout.addLayout(footer)
+        for button in page.findChildren(QPushButton):
+            button.setAutoDefault(False)
 
     def open_settings(self):
         self.settings_dialog.show()
+        self._update_status()
         self.settings_dialog.raise_()
         self.settings_dialog.activateWindow()
 
-    def _use_ibkr(self):
-        self.settings_fields["provider"].setCurrentText("IBKR")
-        self.apply_settings()
+    def save_flex_token(self):
+        account = self.settings_fields["ib_account_id"].text().strip()
+        if not account or account != self.db.setting("ib_account_id"):
+            QMessageBox.warning(self, "Flex token", "Save the IBKR account setting first.")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Save Flex token")
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(QLabel("Paste the Flex Web Service token for this account."))
+        entry = QLineEdit()
+        entry.setEchoMode(QLineEdit.Password)
+        layout.addWidget(entry)
+        buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        token = entry.text().strip()
+        entry.clear()
+        try:
+            save_flex_token(account, token)
+        except Exception as exc:
+            QMessageBox.warning(self, "Flex token", f"Could not save token: {type(exc).__name__}")
+            return
+        QMessageBox.information(self, "Flex token", "Token saved to this computer's credential store.")
+
+    def import_history(self):
+        if self._history_running():
+            QMessageBox.information(self, "Import history", "A historical import is already running.")
+            return
+        if self._flex_sync_running():
+            QMessageBox.information(self, "Import history", "An IBKR Flex sync is running. Wait for it to finish before importing history.")
+            return
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Import historical Flex data")
+        layout = QVBoxLayout(dialog)
+        form = QFormLayout()
+        source = QComboBox()
+        source.addItems(["all", "trades", "analytics", "cash"])
+        first = QLineEdit()
+        last = QLineEdit()
+        first.setPlaceholderText("YYYY-MM-DD")
+        last.setPlaceholderText("YYYY-MM-DD")
+        form.addRow("Source", source)
+        form.addRow("From date", first)
+        form.addRow("To date", last)
+        layout.addLayout(form)
+        layout.addWidget(QLabel("Imports dated Activity Flex reports into your local database."))
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        try:
+            start = date.fromisoformat(first.text().strip())
+            end = date.fromisoformat(last.text().strip())
+            if start > end or end >= date.today():
+                raise ValueError
+        except ValueError:
+            QMessageBox.warning(self, "Import history", "Choose an ordered date range before today (YYYY-MM-DD).")
+            return
+        if self._flex_sync_running():
+            QMessageBox.information(self, "Import history", "An IBKR Flex sync started while the dialog was open. Wait for it to finish, then retry.")
+            return
+        self._start_history_import(source.currentText(), start, end)
+
+    def import_older_statement_trades(self):
+        if not self.db.setting("ib_account_id").strip():
+            QMessageBox.information(self, "Import older trades", "Set and save your IBKR account in Settings first.")
+            return
+        if self._history_running() or self._flex_sync_running():
+            QMessageBox.information(self, "Import older trades", "Wait for the current IBKR import or sync to finish first.")
+            return
+        guide = QMessageBox(self)
+        guide.setWindowTitle("Import older trades")
+        guide.setIcon(QMessageBox.Information)
+        guide.setText("Older trades are individual buy/sell executions from dates IBKR Flex can’t provide.")
+        guide.setInformativeText(
+            "1. Client Portal → Performance & Reports → Statements.\n"
+            "2. Choose the older period, starting at account opening if stocks were transferred in; download an English Activity Statement CSV.\n"
+            "3. Choose that CSV here.\n\n"
+            "Include Trades, Transfers, Open Positions and Financial Instrument Information. "
+            "This imports older executions and verified transferred holdings; it does not add Analytics or Cash history.")
+        guide.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+        guide.setDefaultButton(QMessageBox.Yes)
+        guide.button(QMessageBox.Yes).setText("Choose CSV…")
+        if guide.exec() != QMessageBox.Yes:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Choose an IBKR Activity Statement", "",
+            "IBKR Activity Statement (*.csv);;CSV files (*.csv)")
+        if not path:
+            return
+        try:
+            preview = preview_activity_statement_trades(self.db, path, self.portfolio_id)
+        except Exception as exc:
+            QMessageBox.warning(self, "Import older trades",
+                                f"This statement could not be safely imported:\n\n{exc}\n\nNo trades were changed.")
+            return
+        first, last = preview["period"]
+        question = QMessageBox(self)
+        question.setWindowTitle("Review older trades")
+        question.setIcon(QMessageBox.Information)
+        question.setText(
+            f"IBKR account: {preview['account']}\n"
+            f"Statement dates: {first} to {last}\n"
+            f"Executions found: {len(preview['rows']):,}" +
+            (f"\nTransferred holdings found: {len(preview['transfers']):,} stocks "
+             f"({sum(float(g['quantity']) for g in preview['transfers']):g} shares)"
+             if preview.get('transfers') else '') +
+            (f"\nForex conversion rows not included: {preview['ignored_forex']:,}"
+             if preview.get("ignored_forex") else ""))
+        question.setInformativeText(
+            "Transferred holdings are added only when the statement and saved broker lots verify quantity and cost basis. "
+            "They are recorded as holdings at the statement end date, with original acquisition dates retained.\n\n"
+            "Existing executions and transferred holdings are skipped. This does not add cash or performance history, "
+            "or mark Flex dates as covered.")
+        question.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+        question.setDefaultButton(QMessageBox.Cancel)
+        question.button(QMessageBox.Yes).setText("Import trades")
+        if question.exec() != QMessageBox.Yes:
+            return
+        try:
+            outcome = import_activity_statement_trades(self.db, preview, self.portfolio_id)
+        except Exception as exc:
+            QMessageBox.warning(self, "Import older trades",
+                                f"No trades were imported because the statement could not be reconciled safely:\n\n{exc}")
+            return
+        result = outcome["ingest"]
+        imported = result.inserted if result else 0
+        updated = result.updated if result else 0
+        self._refresh_models()
+        success_message = (
+            f"Executions imported: {imported + updated:,}\n"
+            f"Executions already saved: {outcome['duplicates']:,}\n"
+            + (f"Transferred holdings added: {outcome['transfers_added']:,} stocks "
+               f"({outcome['transfer_quantity']:g} shares)\n"
+               f"Transferred holdings already saved: {outcome['transfers_skipped']:,} stocks\n"
+               if preview.get('transfers') else '') + "\n"
+            + (f"Forex conversion rows not imported: {preview['ignored_forex']:,}\n\n"
+               if preview.get("ignored_forex") else "")
+            + "These records are saved locally. Activity Statement imports remain separate from Flex coverage; "
+            "continue using Sync IBKR for regular updates.")
+        try:
+            reconciliation = reconciliation_status(self.db, self.portfolio_id)
+        except Exception:
+            self.log.exception('Could not read lot diagnostics after a saved statement import')
+            QMessageBox.information(self, 'Older trades imported', success_message +
+                '\n\nThe import was saved, but remaining lot diagnostics could not be read. Check the diagnostic logs.')
+            return
+        if reconciliation['reconciliation_guidance']:
+            box = QMessageBox(self)
+            box.setWindowTitle('Older trades imported; some lots need review')
+            box.setIcon(QMessageBox.Information)
+            box.setTextFormat(Qt.PlainText)
+            box.setText(success_message)
+            box.setInformativeText('Flagged quantities, cost basis or P&L remain unverified.\n\n' +
+                                   '\n'.join(reconciliation['reconciliation_actions']))
+            details = '\n\n'.join(reconciliation['reconciliation_guidance'] +
+                                    reconciliation['reconciliation_details'])
+            box.setDetailedText(details)
+            box.setStandardButtons(QMessageBox.Ok)
+            copy = box.addButton('Copy diagnostics', QMessageBox.ActionRole)
+            copy.clicked.connect(lambda: QApplication.clipboard().setText(details))
+            box.exec()
+        else:
+            QMessageBox.information(self, 'Older trades imported', success_message)
+
+    def _start_history_import(self, source, start, end):
+        if self._history_running() or self._flex_sync_running():
+            QMessageBox.information(self, 'Import history', 'An IBKR import or sync is running. Wait for it to finish, then retry.')
+            return
+        args = ["--source", source, "--from-date", start.isoformat(),
+                "--to-date", end.isoformat(), "--database", str(self.db.path)]
+        status = dict(state="starting", source=source, from_date=start.isoformat(),
+                      to_date=end.isoformat(), started_at=datetime.now().isoformat(timespec="seconds"),
+                      pid=None, message="", pause_supported=True, paused_by_user=False,
+                      account_id=self.db.setting('ib_account_id'))
+        try:
+            pause_request_path(self._history_status_path).unlink(missing_ok=True)
+            write_status(self._history_status_path, status)
+        except OSError as exc:
+            QMessageBox.warning(self, "Import history", f"Could not save import status: {exc}")
+            return
+        command, workdir = [sys.executable, "-m", "scripts.history_worker", "--status-file",
+                            str(self._history_status_path), *args], Path(__file__).resolve().parent.parent
+        try:
+            self._history_process = subprocess.Popen(
+                command, cwd=workdir, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            status.update(state="failed", message=f"Could not start import: {exc}")
+            try:
+                write_status(self._history_status_path, status)
+            except OSError:
+                self.log.exception("Could not record history launch failure")
+            QMessageBox.warning(self, "Import history", f"Could not start import: {exc}")
+            return
+        self._update_sync_button()
+        self._update_history_status()
+        self.statusBar().showMessage("Historical import started; its result will appear in the status bar.", 10000)
+        self._history_timer.start(1000)
+
+    def _check_history_import(self):
+        process = getattr(self, "_history_process", None)
+        if process is None:
+            if not self._history_running():
+                self._history_timer.stop()
+            self._update_history_status()
+            return
+        if process.poll() is None:
+            self._update_history_status()
+            return
+        self._history_process = None
+        status = self._read_history_status()
+        self._history_timer.stop()
+        try:
+            self._update_sync_button()
+            self._update_history_status()
+            self.show_history_import_details()
+            if status.get("state") in ("completed", "completed_with_gaps", "completed_with_review",
+                                       "completed_with_pending_history", "paused"):
+                self._refresh_models()
+        except Exception as exc:
+            self.log.exception("Could not refresh after history import: %s", exc)
 
     def _make_help_dialog(self):
         self.help_dialog = QDialog(self)
@@ -1193,80 +1875,110 @@ class MainWindow(QMainWindow):
             self.help_visuals.append(visual)
             content.addWidget(visual)
 
-        start_content = add_section("Start")
+        start_content = add_section("Initial setup")
         introduction = QLabel(
-            "Portfolio Monitor shows your holdings, trades, cash and performance. "
-            "Rebalance is a planning worksheet; the app does not place orders.")
+            "Track your portfolio. The app cannot place orders.")
         introduction.setObjectName("helpBody")
         introduction.setWordWrap(True)
         start_content.insertWidget(1, introduction)
         add_visual(start_content, "start")
-        add_text(start_content, "Start and refresh",
-                 "1. Sign in to TWS or IB Gateway with its read-only API enabled.\n"
-                 "2. In Settings, choose Use IBKR, confirm the host, port and account, then Apply Settings.\n"
-                 "3. Press Sync IBKR to refresh. For historical trades, performance and cash, "
-                 "enter the Flex query IDs in Settings and save a Flex token with enter_flex_token.cmd. "
-                 "Hover over Sync IBKR to see each source's status.")
+        add_text(start_content, "Connect IBKR",
+                 "1. Open TWS / IB Gateway. Enable the read-only API.\n"
+                 "2. In Settings, choose IBKR. Enter Account; check Connection options.\n"
+                 "3. Click Save settings. Open HISTORICAL_REPORTS.md below.")
+        self.help_setup_button = QPushButton("Open HISTORICAL_REPORTS.md")
+        self.help_setup_button.setObjectName("secondary")
+        self.help_setup_button.setAutoDefault(False)
+        self.help_setup_button.clicked.connect(self.open_historical_reports)
+        start_content.addWidget(self.help_setup_button)
+        add_text(start_content, "Load history",
+                 "1. In Settings > History & Flex, enter all three query IDs.\n"
+                 "2. Save settings. Click Save Flex token and paste it.\n"
+                 "3. Click Sync IBKR, then Import history for older dates.\n"
+                 "Import older trades: CSV trades and verified transferred holdings only.")
+        add_text(start_content, "Pause or check an import",
+                 "Pause import saves progress. Resume import continues.\n"
+                 "Click History status > Show Details to check issues.")
 
         portfolio_content = add_section("Portfolio")
         add_text(portfolio_content, "Overview",
-                 "Review account totals, holdings, P&L and differences from broker positions. "
-                 "Search or select Hide closed to narrow the list. Double-click a holding for its trades and lots.")
+                 "Search or click Hide closed.\n"
+                 "Double-click a holding for trades and lots.")
         add_visual(portfolio_content, "portfolio")
         add_text(portfolio_content, "Trades and Lots",
-                 "Trades lists synced buys and sells; filter by instrument or BUY/SELL. "
-                 "Lots shows shares still held and matched sales; filter by instrument or Open/Closed. "
-                 "These records are read-only here.")
+                 "Trades: buys/sells. Lots: held/sold quantities. Both read-only.\n"
+                 "Profit or loss (P&L) includes fees.\n"
+                 "Realized: matched sales. Open: remaining holdings.\n"
+                 "Matched P&L appears twice. Count it once.")
         add_text(portfolio_content, "Cash",
-                 "Choose a range to review deposits, dividends, interest, tax, fees and transactions. "
-                 "Use Hide zero cash currencies to simplify the view. Hover over Cash check "
-                 "to see which statement dates have been verified.")
+                 "Choose dates. Select Hide zero cash currencies if needed.\n"
+                 "Hover over Cash check for verified dates.")
 
         analytics_content = add_section("Analytics")
         add_text(analytics_content, "P&L and Capital deployment",
-                 "Choose Range or Custom dates; drag across a chart to select dates. "
-                 "Hover over the chart for values. Use Chart and table to place them side by side or top and bottom. "
-                 "P&L charts NAV and returns. Capital deployment charts net invested, buy/sell activity "
-                 "or cash as a share of NAV. S&P 500 adds an index comparison; in P&L, "
-                 "both lines start at 0% at their first available points in the range.")
+                 "Choose Range / Custom dates. Drag to change dates; hover for values.\n"
+                 "Chart and table: Top and bottom / Side by side.\n"
+                 "P&L: account value (NAV) and returns. S&P 500: index comparison.\n"
+                 "Adjusted: removes deposits, withdrawals and transfers.\n"
+                 "Capital deployment: invested money, buys/sells and cash.")
         add_visual(analytics_content, "analytics")
+        add_text(analytics_content, "Daily moves and Sharpe",
+                 "Choose Max USD gain / Max USD loss, or Max % gain / Max % loss.\n"
+                 "Dollar and percentage rankings can pick different days.\n"
+                 "Sharpe ratio: return compared with daily fluctuations.\n"
+                 "Needs 63 completed daily returns. Read the note for gaps.")
+        add_text(analytics_content, "Returns",
+                 "Select a name for lots. Options share their underlying's row.\n"
+                 "Tables: Top and bottom / Side by side.\n"
+                 "Return on cost = total P&L / all purchase costs, including buy fees.\n"
+                 "Shorts: dollars only. Excludes dividends, interest and withholding.")
         add_text(analytics_content, "Exposure",
-                 "See the latest portfolio mix by sector or a custom group. Choose Market value or "
-                 "Adjusted for the pie, category list and position percentages. Click a pie slice "
-                 "to filter positions; use Manage categories to edit custom groups.")
+                 "Choose a group and Market value / Adjusted (includes option sensitivity).\n"
+                 "Click a slice to filter; Manage categories to edit groups.")
 
         rebalance_content = add_section("Rebalance")
         add_text(rebalance_content, "Plan targets and scenarios",
-                 "Enter target weights or a Cash target to see estimated buys and sells. "
-                 "Use Add idea for a stock you do not hold, and enter upside/downside cases to compare outcomes. "
-                 "Show changes the visible columns. Pause updates freezes this tab's prices and weights "
-                 "until you select Resume updates.")
+                 "Enter target weights / Cash target to estimate trades.\n"
+                 "Click Add idea for a stock. Set upside/downside to compare outcomes.\n"
+                 "Show: choose columns. Pause updates: freeze prices and weights.")
         add_visual(rebalance_content, "rebalance")
 
         views_content = add_section("Views & data")
         add_text(views_content, "Tables and saved views",
-                 "Click a column heading to sort; right-click it for column and decimal options. "
-                 "Use View → Save current tab view to remember that tab's filters and layout. "
-                 "Drag tabs to reorder them, then use View → Save tab layout to remember their order. "
-                 "Use File → Export Workbook or Create SQLite Backup to keep a copy of your data.")
+                 "Click headings to sort. Right-click for columns/decimals.\n"
+                 "View > Save current tab view: keep filters and layout.\n"
+                 "Drag tabs to reorder. View > Save tab layout: keep the order.\n"
+                 "Analytics subtab order saves automatically.\n"
+                 "File > Export Workbook: export tables.")
         add_text(views_content, "Data status",
-                 "Live account values can be provisional, and saved data can be older while offline. "
-                 "Check status labels and hover over missing values for details.")
+                 "Today's values aren't final. Offline values may be old.\n"
+                 "Hover over dashes for details.\n"
+                 "Settings > History & Flex > Show all date ranges: coverage.\n"
+                 "Import: High = stopped; Medium = review/action; Low = notice.\n"
+                 "Click Show Details for next steps. Copy diagnostics copies evidence.")
+        add_text(views_content, "Portfolio name and files",
+                 "Rename: Settings > Portfolio name, then Save settings.\n"
+                 "Settings > Diagnostics > Technical details: database path.\n"
+                 "That portfolio's data folder holds reports and logs.\n"
+                 "File > Create SQLite Backup: save a copy.")
 
         shortcuts_content = add_section("Shortcuts")
         grid = QGridLayout()
         grid.setHorizontalSpacing(20)
         grid.setVerticalSpacing(5)
         for number, (keys, action) in enumerate((
-            ("Ctrl+Tab / Ctrl+Shift+Tab", "Move to the next or previous tab"),
+            ("Ctrl+Tab / Ctrl+Shift+Tab", "Next / previous tab"),
             ("Ctrl+Shift+H", "Show or hide the account summary"),
-            ("Enter / F2", "Open a selected input; Enter saves and moves down"),
-            ("Esc", "Cancel an unfinished input"),
-            ("Arrow keys", "Move between input cells, saving the current edit"),
-            ("Ctrl+-", "On a selected Rebalance row, remove an idea or set a holding target to 0%"),
-            ("Shift+Space", "Select the current row"),
-            ("Ctrl+Space", "Select the current column"),
+            ("Enter / F2", "Edit a cell; Enter saves and moves down"),
+            ("Esc", "Cancel the edit"),
+            ("Arrow keys", "Move between input cells and save the edit"),
+            ("Ctrl+-", "Rebalance: remove an idea or set a holding's target to 0%"),
+            ("Shift+Space", "Select the row"),
+            ("Ctrl+Space", "Select the column"),
             ("Ctrl+C", "Copy the selection"),
+            ("Ctrl+V", "Paste into an editable field or cell"),
+            ("Ctrl+X", "Cut selected text in an input field"),
+            ("Ctrl+A", "Select all in the input or table"),
             ("F1", "Open this guide"),
         )):
             key_label = QLabel(keys)
@@ -1284,6 +1996,14 @@ class MainWindow(QMainWindow):
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
         buttons.rejected.connect(self.help_dialog.reject)
         dialog_layout.addWidget(buttons)
+
+    def open_historical_reports(self):
+        guide = Path(__file__).resolve().parent.parent / "HISTORICAL_REPORTS.md"
+        if not guide.is_file():
+            QMessageBox.warning(self, "Flex setup guide", "HISTORICAL_REPORTS.md is missing from the app folder.")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(guide))):
+            QMessageBox.warning(self, "Flex setup guide", "Could not open the guide. Open HISTORICAL_REPORTS.md in the app folder.")
 
     def open_help(self):
         current = self.tabs.currentWidget()
@@ -1321,13 +2041,15 @@ class MainWindow(QMainWindow):
                 self._saved_default_view(self._current_table_name()) is not None),
             self.restore_tabs_action.setEnabled(self._saved_tab_layout() is not None)))
         help_menu = self.menuBar().addMenu("Help")
-        guide_action = QAction("User guide (F1)", self)
+        guide_action = QAction("User guide", self)
+        guide_action.setShortcut(QKeySequence("F1"))
+        guide_action.setShortcutContext(Qt.ApplicationShortcut)
         guide_action.triggered.connect(self.open_help)
         help_menu.addAction(guide_action)
 
     def _restore_columns(self):
         use_saved = self.db.setting("header_layout_version") == "3"
-        portfolio_saved = self.db.setting("portfolio_columns_version") == "3"
+        portfolio_saved = self.db.setting("portfolio_columns_version") == "4"
         for name, view in self.views.items():
             state = self.db.setting(f"header_{name}")
             if use_saved and state and (name != "Portfolio" or portfolio_saved):
@@ -1340,7 +2062,7 @@ class MainWindow(QMainWindow):
                     for column in (8, 9, 10, 11):
                         view.hideColumn(column)
                 elif name == "Portfolio":
-                    for column in (12, 13, 14):
+                    for column in (13, 14, 15):
                         view.hideColumn(column)
                 else:
                     view.horizontalHeader().setDefaultSectionSize(105)
@@ -1349,14 +2071,46 @@ class MainWindow(QMainWindow):
                         view.setColumnWidth(column, width)
                     for column in (10, 11, 12):
                         view.hideColumn(column)
+            if name == "Trades" and self.db.setting("trade_pnl_columns_intro_applied") != "1":
+                self._introduce_trade_pnl_columns()
+                self.db.set_setting("trade_pnl_columns_intro_applied", "1")
+            if name == "Trades" and self.db.setting("trade_pnl_pct_columns_intro_applied") != "1":
+                self._introduce_trade_pnl_percent_columns()
+                self.db.set_setting("trade_pnl_pct_columns_intro_applied", "1")
             if name == "Portfolio" and self.db.setting("price_move_bars_intro_applied") != "1":
-                for column in (8, 9, 10):
+                for column in (9, 10, 11):
                     view.showColumn(column)
                 self.db.set_setting("price_move_bars_intro_applied", "1")
         if not use_saved:
             self.db.set_setting("header_layout_version", "3")
         if not portfolio_saved:
-            self.db.set_setting("portfolio_columns_version", "3")
+            self.db.set_setting("portfolio_columns_version", "4")
+
+    def _introduce_trade_pnl_columns(self):
+        view = self.views["Trades"]
+        header = view.horizontalHeader()
+        columns = {key: index for index, (key, _, _) in enumerate(TRADES)}
+        for key, after, width in (("last_price", "price", 110),
+                                  ("realized_net", "gross_usd", 140),
+                                  ("net_unrealized", "realized_net", 140),
+                                  ("price_source", "match_status", 150),
+                                  ("pnl_note", "price_source", 190)):
+            column = columns[key]
+            view.showColumn(column)
+            view.setColumnWidth(column, width)
+            header.moveSection(header.visualIndex(column), header.visualIndex(columns[after]) + 1)
+        self._introduce_trade_pnl_percent_columns()
+
+    def _introduce_trade_pnl_percent_columns(self):
+        view = self.views["Trades"]
+        header = view.horizontalHeader()
+        columns = {key: index for index, (key, _, _) in enumerate(TRADES)}
+        for key, after in (("realized_pct", "realized_net"), ("unrealized_pct", "net_unrealized")):
+            column = columns[key]
+            view.showColumn(column)
+            view.setColumnWidth(column, 130)
+            source, target = header.visualIndex(column), header.visualIndex(columns[after]) + 1
+            header.moveSection(source, target - 1 if source < target else target)
 
     def _current_table_name(self):
         name = self.tabs.tabBar().tabData(self.tabs.currentIndex())
@@ -1495,6 +2249,10 @@ class MainWindow(QMainWindow):
         header = self.views[name].horizontalHeader()
         if state["header"] is not None:
             header.restoreState(QByteArray.fromBase64(state["header"].encode("ascii")))
+        if name == "Trades" and "realized_net" not in state.get("columns", ()):
+            self._introduce_trade_pnl_columns()
+        elif name == "Trades" and "realized_pct" not in state.get("columns", ()):
+            self._introduce_trade_pnl_percent_columns()
         self.search_fields[name].setText(state["search"])
         if name == "Portfolio":
             self.hide_closed_checkbox.setChecked(state.get("hide_closed") is True)
@@ -1515,7 +2273,7 @@ class MainWindow(QMainWindow):
             self.restore_default_view(name)
 
     def closeEvent(self, event):
-        if self._pending_data_directory is not None and (self._sync_all_active or self._sync_all_queue or any(
+        if self._pending_data_directory is not None and (self._history_running() or self._sync_all_active or self._sync_all_queue or any(
                 process is not None and process.poll() is None for process in
                 (self._sync_process, self._analytics_process, self._cash_process))):
             event.ignore()
@@ -1528,7 +2286,9 @@ class MainWindow(QMainWindow):
             model = self.models[name]
             self.db.set_setting(f"sort_{name}", f"{model.sort_column}:{'desc' if model.sort_order == Qt.DescendingOrder else 'asc'}")
         self.timer.stop()
+        self.sync_request_timer.stop()
         self.refresh_timer.stop()
+        self._history_timer.stop()
         self.lots_refresh_timer.stop()
         self.calcs_refresh_timer.stop()
         if isinstance(self.market, IBKRMarketDataProvider):
@@ -1653,10 +2413,11 @@ class MainWindow(QMainWindow):
         index = view.indexAt(point)
         if index.isValid() and index not in view.selectedIndexes():
             view.setCurrentIndex(index)
-        menu = QMenu(self)
+        menu = add_table_copy_actions(QMenu(self), view)
         if name == "Portfolio":
             row = self.selected_row("Portfolio")
             if row:
+                menu.addSeparator()
                 menu.addAction("Position details", lambda checked=False: self.show_position_details())
         if not menu.isEmpty():
             menu.exec(view.viewport().mapToGlobal(point))
@@ -1693,6 +2454,10 @@ class MainWindow(QMainWindow):
         current_key = (self._row_identity(name, model.rows[current.row()]), current.column()) if current.isValid() and current.row() < len(model.rows) else None
         axis = view.selection_axis
         model.refresh(rows)
+        column = 0 if name == "Portfolio" else 1
+        fit_option_name_column(view, column,
+                               (row.get("display_ticker") or row.get("ticker") for row in model.rows),
+                               self.db, f"option_name_width_{name}_{self.portfolio_id}")
         positions = {self._row_identity(name, row): number for number, row in enumerate(model.rows)}
         selection = view.selectionModel()
         for number, (key, column) in enumerate(chosen):
@@ -1723,11 +2488,14 @@ class MainWindow(QMainWindow):
             f"    ·    1M {self._pct(position.get('1m'))}    ·    3M {self._pct(position.get('3m'))}"
             f"    ·    ADV20 {display_number(position['adv20']) if position.get('adv20') is not None else '—'}"
             f"    ·    Status {position['data_status']}"))
-        trades = [t for t in self.service.matching.trade_rows() if t["position_id"] == position["id"]]
+        trades = [t for t in self.service.trade_rows() if t["position_id"] == position["id"]]
         lots = [lot for lot in self.service.lots_rows() if lot.get("position_id") == position["id"]]
         for title, records, specs in (
             ("Trades", trades, [("trade_date", "Date"), ("side", "Side"), ("quantity", "Qty"),
-                                ("price", "Price"), ("commission_usd", "Fee USD"), ("match_status", "Match")]),
+                                ("price", "Price"), ("commission_usd", "Fee USD"), ("match_status", "Match"),
+                                ("last_price", "Last price"), ("realized_net", "Realized P&L USD"),
+                                ("realized_pct", "Realized P&L %"), ("net_unrealized", "Open P&L USD"),
+                                ("unrealized_pct", "Open P&L %")]),
             ("Lots", lots, [("buy_date", "Buy"), ("buy_qty", "Qty"), ("buy_price", "Cost"),
                              ("sell_date", "Sale"), ("realized_net", "Realized USD"),
                              ("net_unrealized", "Open P&L USD")])):
@@ -1735,14 +2503,16 @@ class MainWindow(QMainWindow):
             table = ReportTable(len(records), len(specs))
             table.setHorizontalHeaderLabels([label for _, label in specs])
             numeric_keys = {"quantity", "price", "commission_usd", "buy_qty", "buy_price",
-                            "sell_price", "realized_net", "net_unrealized"}
-            numeric_formats = {column: (2, "plain") for column, (key, _) in enumerate(specs)
+                            "sell_price", "realized_net", "net_unrealized", "last_price", "realized_pct", "unrealized_pct"}
+            numeric_formats = {column: (2, "percent" if key in ("realized_pct", "unrealized_pct") else "plain") for column, (key, _) in enumerate(specs)
                                if key in numeric_keys}
             table.configure_numbers(self.db, f"position_details_{title.lower()}_decimals_{self.portfolio_id}",
                                     numeric_formats)
             for row_num, record in enumerate(records):
                 for col_num, (key, _) in enumerate(specs):
                     value = record.get(key)
+                    if key in ("realized_pct", "unrealized_pct") and value is not None:
+                        value *= 100
                     table.setItem(row_num, col_num, table.numeric_item(col_num, value)
                                   if key in numeric_keys else SortItem("" if value is None else str(value)))
             table.setSortingEnabled(True)
@@ -1764,8 +2534,9 @@ class MainWindow(QMainWindow):
     def _refresh_models(self):
         portfolio = self.service.portfolio_rows()
         lots = self.service.lots_rows(portfolio)
+        trades = self.service.trade_rows(portfolio, lots)
         for name in self.models:
-            self._refresh_model(name, portfolio if name == "Portfolio" else lots if name == "Lots" else None)
+            self._refresh_model(name, portfolio if name == "Portfolio" else lots if name == "Lots" else trades)
         if self.tabs.currentWidget() is self.calcs_tab:
             self._refresh_calcs_live()
         if self.tabs.currentWidget() is self.cash_tab:
@@ -1773,6 +2544,12 @@ class MainWindow(QMainWindow):
         if self.tabs.currentWidget() is self.analytics_tab:
             self.analytics_tab.refresh()
         self._refresh_summary(portfolio, lots)
+
+    def _refresh_trade_lots(self):
+        portfolio = self.service.portfolio_rows()
+        lots = self.service.lots_rows(portfolio)
+        self._refresh_model("Trades", self.service.trade_rows(portfolio, lots))
+        self._refresh_model("Lots", lots)
 
     def _refresh_summary(self, rows=None, lots=None):
         self._update_account_heading()
@@ -1832,6 +2609,23 @@ class MainWindow(QMainWindow):
                               "Current daily P&L needs a current-session price and prior close" if
                               key == "daily" and text == "—" else
                               "Not available from the connected account" if text == "—" else note.strip()))
+            if key == "daily":
+                excluded = [r for r in active if r["reconciliation"] == "DIFFERENCE"
+                            or r["daily_pnl"] is None]
+                if excluded:
+                    details = []
+                    for row in excluded:
+                        reason = row.get("daily_pnl_note")
+                        if row["reconciliation"] == "DIFFERENCE":
+                            reason = "position quantity differs from broker"
+                        elif not reason:
+                            reason = ("missing current-session price" if row.get("last_px") is None else
+                                      "missing current-session price or prior close")
+                        details.append(f"{row['display_ticker']}: {reason}")
+                    label.setToolTip(
+                        ("Subtotal only" if text.startswith("Partial ") else "Daily P&L unavailable")
+                        + f" — excluded {len(excluded)} of {len(active)} holdings:\n"
+                        + "\n".join(details) + note)
         daily_label = self.metric_values["daily"]
         trend = "neutral" if incomplete or daily == 0 else "positive" if daily > 0 else "negative"
         if daily_label.property("pnlTrend") != trend:
@@ -1898,22 +2692,44 @@ class MainWindow(QMainWindow):
             values = {}
             for key, widget in self.settings_fields.items():
                 value = widget.currentText() if isinstance(widget, QComboBox) else widget.text().strip()
+                if key == "provider" and value == "Demo":
+                    value = "Mock"
                 values[key] = "1" if key == "autosave" and value == "On" else "0" if key == "autosave" else value
             if int(values["ib_port"]) <= 0 or int(values["ib_client_id"]) < 0 or int(values["refresh_seconds"]) < 1:
                 raise ValueError("Port, client ID, and refresh interval must be valid positive numbers")
             self.db.validate_account_change(values["ib_account_id"])
-            directory_changed = values["data_directory"] != self.db.setting("data_directory")
-            target_dir = Path(values["data_directory"]) if values["data_directory"] else user_data_dir()
+            portfolio_name = self.db.validate_portfolio_name(self.portfolio_id, values.pop("portfolio_name"))
+            directory_changed = (not self._database_path_override and
+                                 values["data_directory"] != self.db.setting("data_directory"))
+            target_dir = validate_data_directory(values["data_directory"] or self.db.path.parent)
+            if values["backup_directory"]:
+                validate_data_directory(values["backup_directory"])
             target = target_dir / "portfolio.sqlite3"
-            pending_move = target.resolve() != self.db.path.resolve()
+            pending_move = directory_changed and target.resolve() != self.db.path.resolve()
             if pending_move and target.exists():
                 raise FileExistsError(f"A portfolio database already exists at {target}")
+            name_changed = portfolio_name != self.db.portfolio_name(self.portfolio_id)
+            settings_changed = any(value != self.db.setting(key) for key, value in values.items()
+                                   if key != "data_directory" or not self._database_path_override)
+            if name_changed:
+                self.db.rename_portfolio(self.portfolio_id, portfolio_name)
+                self.setWindowTitle(f"Portfolio Monitor · {portfolio_name}")
+            self.settings_fields["portfolio_name"].setText(portfolio_name)
+            if name_changed and not settings_changed:
+                self.statusBar().showMessage("Portfolio renamed", 5000)
+                return
             for key, value in values.items():
+                if key == "data_directory" and self._database_path_override:
+                    continue
                 self.db.set_setting(key, value)
             self._pending_data_directory = values["data_directory"] if pending_move else None
-            self.use_ibkr_button.setVisible(values["provider"] != "IBKR")
             self._set_refresh_interval()
+            self._live_sync_pending = False
+            self._live_sync_events.clear()
             self._start_provider()
+            self._sync_progress_active = True
+            if isinstance(self.market, IBKRMarketDataProvider):
+                self._watch_live_sync()
             self._queue_configured_syncs()
             self._update_sync_button()
             self._refresh_models()
@@ -1986,7 +2802,7 @@ class MainWindow(QMainWindow):
         if isinstance(self.market, MockMarketDataProvider):
             ids = self.market.refresh(self.db.rows("positions", self.portfolio_id))
             self.models["Portfolio"].update_positions(ids)
-            self._refresh_model("Lots")
+            self._refresh_trade_lots()
             self._update_status()
         elif not force and time.monotonic() - self._last_connection_attempt < 3:
             self._update_status()
@@ -2012,9 +2828,10 @@ class MainWindow(QMainWindow):
         self._advance_sync_queue()
         running = any(process is not None and process.poll() is None for process in
                       (self._sync_process, self._analytics_process, self._cash_process))
-        if not self._sync_all_active and not running:
+        if not self._sync_all_active and not running and not self._history_running():
             today = date.today().isoformat()
-            if self.db.setting("flex_query_id") and (not stamp or stamp[:10] != today):
+            if (self.db.setting("flex_query_id") and not trade_sync_paused(self.db)
+                    and (not stamp or stamp[:10] != today)):
                 self._launch_flex_sync()
             elif (self.db.setting("analytics_flex_query_id") and
                   (not analytics_stamp or analytics_stamp[:10] != today)):
@@ -2071,6 +2888,7 @@ class MainWindow(QMainWindow):
                 (isinstance(self.market, IBKRMarketDataProvider) and not self.market.connected and
                  self.market.thread is not None and not self.market.thread.is_alive())):
             self._live_sync_pending = False
+            self._finish_live_sync(success=False)
         if (not self._sync_all_active and not was_connected and self.market.connected and
             isinstance(self.market, IBKRMarketDataProvider)):
             self._launch_flex_sync()
@@ -2081,9 +2899,13 @@ class MainWindow(QMainWindow):
             if not self.summary_refresh_timer.isActive():
                 self.summary_refresh_timer.start(1000)
             if (self.tabs.currentWidget() is self.analytics_tab and
-                    self.analytics_tab.sections.currentWidget() is self.analytics_tab.exposure_page and
+                    self.analytics_tab.sections.currentWidget() in
+                    (self.analytics_tab.exposure_page, self.analytics_tab.returns_page) and
                     time.monotonic() - getattr(self, "_last_exposure_refresh", 0) >= 2):
-                self.analytics_tab.refresh_exposure()
+                if self.analytics_tab.sections.currentWidget() is self.analytics_tab.returns_page:
+                    self.analytics_tab.returns_page.refresh()
+                else:
+                    self.analytics_tab.refresh_exposure()
                 self._last_exposure_refresh = time.monotonic()
             if (self.tabs.currentWidget() is self.calcs_tab and not self.calcs_tab.updates_paused and
                     not self.calcs_refresh_timer.isActive()):
@@ -2248,7 +3070,7 @@ class MainWindow(QMainWindow):
                     if completed:
                         self.db.save_history(con_id, completed)
                         self.models["Portfolio"].update_positions({p["id"] for p in self.db.rows("positions", self.portfolio_id) if p.get("con_id") == con_id})
-                        self._refresh_model("Lots")
+                        self._refresh_trade_lots()
                         if not self.summary_refresh_timer.isActive():
                             self.summary_refresh_timer.start(1000)
             if (exposure_updated and self.tabs.currentWidget() is self.analytics_tab and
@@ -2280,6 +3102,7 @@ class MainWindow(QMainWindow):
             required_live_events.add("executions_end")
         if self._live_sync_pending and required_live_events <= self._live_sync_events:
             self._live_sync_pending = False
+            self._finish_live_sync(success=True)
         self._advance_sync_queue()
         self._update_sync_button()
         self._update_status()
@@ -2323,14 +3146,11 @@ class MainWindow(QMainWindow):
             issues_text += f"; and {len(quote_issues) - 3} more"
         last_sync = (self.db.metadata("ibkr_flex_sync_completed") or "—").replace("T", " ")
         sync_status = self._trade_flex_display_status()
-        if sync_status in ("failed", "statement pending"):
-            link_color = COLORS[self.theme]["warning" if sync_status == "statement pending" else "negative"]
+        if sync_status in ("failed", "paused"):
+            link = status_link(self.theme, "details", sync_status)
             self.trade_sync_status.setText(
-                f"Trades synced: {escape(last_sync)} (<a href=\"details\" "
-                f"style=\"color: {link_color}; text-decoration: underline;\">{sync_status}</a>)")
-            self.trade_sync_status.setToolTip(
-                "Click for the Flex statement response and diagnostic log" if sync_status == "statement pending"
-                else "Click for the trade sync error and diagnostic log")
+                f"Trades synced: {escape(last_sync)} ({link})")
+            self.trade_sync_status.setToolTip("Click for the trade sync error and diagnostic log")
             self.trade_sync_status.setCursor(Qt.PointingHandCursor)
         else:
             self.trade_sync_status.setText(f"Trades synced: {escape(last_sync)} ({escape(sync_status)})")
@@ -2341,11 +3161,25 @@ class MainWindow(QMainWindow):
             f"IBKR: {connected}    Data: {mode}    Last price: {updated}"
             f"{'    Quote issues: ' + str(len(quote_issues)) if quote_issues else ''}")
         last_history = self.db.conn.execute("SELECT MAX(value) FROM app_metadata WHERE key LIKE 'history_refresh_%'").fetchone()[0] or "—"
-        self.settings_info.setText(
-            f"Connection: {connected}    Market data: {mode}    Subscribed symbols: {self.market.subscriptions:,}\n"
-            f"Current prices: {current}/{total}    Quote issues: {issues_text or 'none'}\n"
+        warnings = []
+        if quote_issues:
+            warnings.append(f"Quote issues: {issues_text}")
+        if self._connection_error:
+            warnings.append(f"Connection: {self._connection_error}")
+        flex_error = self.db.metadata('ibkr_flex_sync_error')
+        if sync_status in ("failed", "paused"):
+            warnings.append(f"Trades sync {sync_status}: {flex_error or 'See technical details.'}")
+        details = (
             f"Last historical refresh: {last_history}\n"
             f"Recent Gateway executions checked: {recent_check}\n"
             f"Historical Flex sync: {last_sync} ({sync_status})"
-            f"  {self.db.metadata('ibkr_flex_sync_error')[:120]}\n"
-            f"{self._connection_error[:120]}\nDatabase: {self.db.path}")
+            f"\nFlex sync details: {flex_error or 'None'}\n"
+            f"Connection details: {self._connection_error or 'None'}\n"
+            f"Quote details: {'; '.join(quote_issues) or 'None'}\nDatabase: {self.db.path}")
+        self.settings_status.update_status(self.db, self.portfolio_id, {
+            "Connection": connected, "Market data": mode,
+            "Subscribed symbols": f"{self.market.subscriptions:,}",
+            "Current prices": f"{current}/{total}",
+        }, warnings, details, refresh_history=(self.settings_dialog.isVisible() or
+                                              not hasattr(self, "_settings_status_initialized")))
+        self._settings_status_initialized = True

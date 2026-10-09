@@ -22,7 +22,8 @@ def main(database_path=None):
         db.set_metadata("ibkr_cash_sync_status", "failed")
         db.set_metadata("ibkr_cash_sync_error", str(exc)[:500])
         log.error("Cash history sync failed: %s", type(exc).__name__)
-        print(f"IBKR Cash history sync failed: {type(exc).__name__}", file=sys.stderr)
+        if sys.stderr is not None:
+            print(f"IBKR Cash history sync failed: {type(exc).__name__}", file=sys.stderr)
         return 1
     finally:
         db.conn.close()

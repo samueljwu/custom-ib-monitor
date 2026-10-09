@@ -1,5 +1,6 @@
-"""Two focused account analytics views with a shared, draggable date range."""
+"""Account charts, lifetime returns and current exposure inside Analytics."""
 
+import json
 import math
 from bisect import bisect_left
 from collections import defaultdict
@@ -14,8 +15,9 @@ from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDateEdit, QHBoxLay
                                QSplitter, QStackedWidget, QTabWidget, QTableWidget, QTableWidgetItem,
                                QVBoxLayout, QWidget)
 
-from app.analytics import capital_flow_rows, cash_share_rows, performance_window_rows
+from app.analytics import capital_flow_rows, cash_share_rows, performance_window_rows, sharpe_ratio
 from app.exposure_ui import ExposurePanel
+from app.returns_ui import ReturnsPanel
 from app.table_ui import ReportTable, SortItem
 from app.themed_checkbox import ThemedCheckBox
 from app.ui_theme import (COLORS, TOOLBAR_GROUP_SPACING, TOOLBAR_ITEM_SPACING,
@@ -417,7 +419,44 @@ class TimeRangeNavigator(QWidget):
         event.accept()
 
 
+class AnalyticsSections(QTabWidget):
+    """Keep the tab bar fixed while each report scrolls independently."""
+
+    def addTab(self, page, label):
+        scroller = QScrollArea()
+        scroller.setObjectName("analyticsScroller")
+        scroller.setFrameShape(QScrollArea.NoFrame)
+        scroller.setWidgetResizable(True)
+        scroller.setMinimumSize(0, 0)
+        scroller.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
+        scroller.setWidget(page)
+        return super().addTab(scroller, label)
+
+    def widget(self, index):
+        scroller = super().widget(index)
+        return scroller.widget() if scroller is not None else None
+
+    def currentWidget(self):
+        return self.widget(self.currentIndex())
+
+    def indexOf(self, page):
+        return next((index for index in range(self.count())
+                     if self.widget(index) is page), -1)
+
+    def setCurrentWidget(self, page):
+        index = self.indexOf(page)
+        if index >= 0:
+            self.setCurrentIndex(index)
+
+
 class AnalyticsTab(QWidget):
+    DEFAULT_SECTION_ORDER = ("pnl", "returns", "capital", "exposure")
+    DAILY_EXTREMES = (
+        ("usd_gain", "Max USD gain", "daily_pnl", True),
+        ("usd_loss", "Max USD loss", "daily_pnl", False),
+        ("percent_gain", "Max % gain", "daily_return", True),
+        ("percent_loss", "Max % loss", "daily_return", False),
+    )
     METRICS = (
         ("NAV", "nav", "USD"),
         ("NAV change", "nav_change", "USD"),
@@ -439,19 +478,14 @@ class AnalyticsTab(QWidget):
         outer.setContentsMargins(14, 12, 14, 12)
         outer.setSpacing(8)
 
-        heading = QHBoxLayout()
-        title = QLabel("Account analytics")
-        title.setObjectName("helpSection")
-        heading.addWidget(title)
         self.sync_status = QLabel()
         self.sync_status.setObjectName("hint")
-        heading.addWidget(self.sync_status, 1)
-        outer.addLayout(heading)
 
         self.controls_panel = QWidget()
         controls = QVBoxLayout(self.controls_panel)
         controls.setContentsMargins(0, 0, 0, 0)
         controls.setSpacing(6)
+        controls.addWidget(self.sync_status)
         main_controls = QHBoxLayout()
         main_controls.setSpacing(TOOLBAR_GROUP_SPACING)
         detail_controls = QHBoxLayout()
@@ -464,7 +498,7 @@ class AnalyticsTab(QWidget):
         style_toolbar_dropdown(self.metric_combo)
         self.metric_combo.addItems([metric[0] for metric in self.METRICS])
         self.metric_combo.setCurrentText("Adjusted NAV change")
-        self.metric_combo.setFixedWidth(280)
+        self.metric_combo.setMaximumWidth(280)
         self.metric_combo.currentIndexChanged.connect(self._render_pnl_chart)
         chart_controls.addWidget(self.metric_combo)
         main_controls.addLayout(chart_controls)
@@ -474,7 +508,7 @@ class AnalyticsTab(QWidget):
         self.capital_combo.setFixedWidth(240)
         self.capital_combo.currentIndexChanged.connect(self._capital_chart_changed)
         main_controls.addWidget(self.capital_combo)
-        self.benchmark_toggle = ThemedCheckBox("S&P 500")
+        self.benchmark_toggle = ThemedCheckBox("S&&P 500")
         self.benchmark_toggle.setChecked(True)
         self.benchmark_toggle.setToolTip("Show S&P 500 price change on the right percent axis")
         self.benchmark_toggle.toggled.connect(self._benchmark_toggled)
@@ -490,12 +524,12 @@ class AnalyticsTab(QWidget):
         self.range_combo.setCurrentText("3 months")
         self.range_combo.setFixedWidth(140)
         range_controls.addWidget(self.range_combo)
+        self.date_summary = QLabel()
+        self.date_summary.setObjectName("hint")
+        range_controls.addWidget(self.date_summary)
         main_controls.addLayout(range_controls)
         main_controls.addStretch()
         controls.addLayout(main_controls)
-        self.date_summary = QLabel()
-        self.date_summary.setObjectName("hint")
-        detail_controls.addWidget(self.date_summary)
         start_controls = QHBoxLayout()
         start_controls.setSpacing(TOOLBAR_ITEM_SPACING)
         self.start_label = QLabel("From")
@@ -522,37 +556,67 @@ class AnalyticsTab(QWidget):
         detail_controls.addStretch()
         controls.addLayout(detail_controls)
 
-        self.sections = QTabWidget()
+        self.sections = AnalyticsSections()
+        self.sections.setMovable(True)
+        self.sections.tabBar().setToolTip("Drag subtabs to reorder; the order is saved automatically")
         self.sections.setObjectName("analyticsSections")
         self.sections.setMinimumWidth(0)
         self.sections.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
         self.pnl_page = QWidget()
+        self.returns_page = ReturnsPanel(db, service, portfolio_id)
         self.capital_page = QWidget()
         self.exposure_page = ExposurePanel(db, service, portfolio_id)
-        for page in (self.pnl_page, self.capital_page, self.exposure_page):
+        for page in (self.pnl_page, self.returns_page, self.capital_page, self.exposure_page):
             page.setObjectName("analyticsSection")
             page.setMinimumWidth(0)
             page.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
-        self.sections.addTab(self.pnl_page, "P&L")
+        self.sections.addTab(self.pnl_page, "P&&L")
+        self.sections.addTab(self.returns_page, "Returns")
         self.sections.addTab(self.capital_page, "Capital deployment")
         self.sections.addTab(self.exposure_page, "Exposure")
-        scroller = QScrollArea()
-        scroller.setObjectName("analyticsScroller")
-        scroller.setFrameShape(QScrollArea.NoFrame)
-        scroller.setWidgetResizable(True)
-        scroller.setMinimumWidth(0)
-        scroller.setMinimumHeight(0)
-        scroller.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Expanding)
-        scroller.setWidget(self.sections)
-        outer.addWidget(scroller, 1)
+        for index, key in enumerate(self.DEFAULT_SECTION_ORDER):
+            self.sections.tabBar().setTabData(index, key)
+        self._restoring_section_order = False
+        outer.addWidget(self.sections, 1)
         self._build_pnl()
         self._build_capital()
         self.sections.currentChanged.connect(self._update_section_controls)
         self._update_section_controls()
         self.range_combo.currentTextChanged.connect(self._preset_changed)
         self._preset_changed("3 months")
+        try:
+            saved_order = json.loads(self.db.setting(f"analytics_section_order_{self.portfolio_id}"))
+        except (TypeError, ValueError):
+            saved_order = None
+        self._apply_section_order(saved_order)
+        self.sections.tabBar().tabMoved.connect(self._save_section_order)
 
-    def _metric_summary(self, layout, labels, *, show_close=False):
+    def section_order(self):
+        return [self.sections.tabBar().tabData(index) for index in range(self.sections.count())]
+
+    def _save_section_order(self, *_):
+        if not self._restoring_section_order:
+            self.db.set_setting(f"analytics_section_order_{self.portfolio_id}", json.dumps(self.section_order()))
+
+    def _apply_section_order(self, order):
+        if (not isinstance(order, list) or not order or
+                not all(isinstance(key, str) and key in self.DEFAULT_SECTION_ORDER for key in order) or
+                len(set(order)) != len(order)):
+            return False
+        order = order + [key for key in self.DEFAULT_SECTION_ORDER if key not in order]
+        active = self.sections.currentWidget()
+        self._restoring_section_order = True
+        try:
+            for destination, key in enumerate(order):
+                source = self.section_order().index(key)
+                if source != destination:
+                    self.sections.tabBar().moveTab(source, destination)
+            self.sections.setCurrentWidget(active)
+        finally:
+            self._restoring_section_order = False
+        return True
+
+    def _metric_summary(self, layout, labels, *, show_close=False, details=None, captions=None):
         summary = QWidget()
         summary.setObjectName("analyticsSummary")
         row = QHBoxLayout(summary)
@@ -562,12 +626,21 @@ class AnalyticsTab(QWidget):
         for label in labels:
             block = QVBoxLayout()
             block.setSpacing(2)
-            caption = QLabel(label)
-            caption.setObjectName("metricLabel")
+            caption = captions.get(label) if captions else None
+            if caption is None:
+                caption = QLabel(label)
+                caption.setObjectName("metricLabel")
+                caption.setWordWrap(bool(captions))
             value = QLabel("—")
             value.setObjectName("metricValue")
             block.addWidget(caption)
             block.addWidget(value)
+            if details is not None:
+                detail = QLabel("")
+                detail.setObjectName("hint")
+                detail.setWordWrap(bool(captions))
+                block.addWidget(detail)
+                details[label] = detail
             row.addLayout(block, 1)
             values[label] = value
         if show_close:
@@ -606,12 +679,17 @@ class AnalyticsTab(QWidget):
             for widget in (self.start_label, self.start_date, self.end_label, self.end_date,
                            self.reset_button, self.date_summary):
                 widget.hide()
-            self.refresh_exposure()
+            if self.sections.currentWidget() is self.returns_page:
+                self.returns_page.refresh()
+            else:
+                self.refresh_exposure()
 
     def _update_range_controls(self):
-        if self.sections.currentWidget() is self.exposure_page:
+        if self.sections.currentWidget() not in (self.pnl_page, self.capital_page):
             return
         custom = self.range_combo.currentText() == "Custom"
+        self.metric_combo.ensurePolished()
+        self.metric_combo.setMinimumWidth(self.metric_combo.sizeHint().width())
         for widget in (self.start_label, self.start_date, self.end_label, self.end_date,
                        self.reset_button):
             widget.setVisible(custom)
@@ -741,21 +819,27 @@ class AnalyticsTab(QWidget):
         return {
             "version": 1,
             "section": self.sections.currentIndex(),
+            "section_name": self.sections.tabText(self.sections.currentIndex()).replace("&&", "&"),
+            "section_order": self.section_order(),
             "range": self.range_combo.currentText(),
             "start": self.start_date.date().toString("yyyy-MM-dd"),
             "end": self.end_date.date().toString("yyyy-MM-dd"),
             "metric": self.metric_combo.currentText(),
+            "daily_extreme": self.daily_extreme_combo.currentData(),
             "capital_chart": self.capital_combo.currentText(),
             "benchmark": self.benchmark_toggle.isChecked(),
             "pnl": pane(self.pnl_splitter, self.pnl_table),
             "capital": {**pane(self.capital_splitter, self.capital_table),
                         "cash_table": self._table_view_state(self.cash_share_table)},
             "exposure": self.exposure_page.view_state(),
+            "returns": self.returns_page.view_state(),
         }
 
     def apply_view_state(self, state):
         if not isinstance(state, dict) or state.get("version") != 1:
             return False
+        if self._apply_section_order(state.get("section_order")):
+            self._save_section_order()
         for combo, value in ((self.metric_combo, state.get("metric")),
                              (self.capital_combo, state.get("capital_chart")),
                              (self.range_combo, state.get("range"))):
@@ -763,6 +847,9 @@ class AnalyticsTab(QWidget):
                 combo.setCurrentText(value)
         if isinstance(state.get("benchmark"), bool):
             self.benchmark_toggle.setChecked(state["benchmark"])
+        extreme_index = self.daily_extreme_combo.findData(state.get("daily_extreme"))
+        if extreme_index >= 0:
+            self.daily_extreme_combo.setCurrentIndex(extreme_index)
         try:
             first = date.fromisoformat(state["start"])
             last = date.fromisoformat(state["end"])
@@ -789,7 +876,15 @@ class AnalyticsTab(QWidget):
             if name == "capital":
                 self._apply_table_view_state(self.cash_share_table, pane.get("cash_table"))
         self.exposure_page.apply_view_state(state.get("exposure"))
+        self.returns_page.apply_view_state(state.get("returns"))
         section = state.get("section")
+        section_name = state.get("section_name")
+        # Older saved views used P&L / Capital deployment / Exposure indices.
+        if section_name is None and isinstance(section, int) and not isinstance(section, bool) and 0 <= section < 3:
+            section_name = ("P&L", "Capital deployment", "Exposure")[section]
+        if isinstance(section_name, str):
+            section = next((i for i in range(self.sections.count())
+                            if self.sections.tabText(i).replace("&&", "&") == section_name), section)
         if isinstance(section, int) and not isinstance(section, bool) and 0 <= section < self.sections.count():
             self.sections.setCurrentIndex(section)
         return True
@@ -799,8 +894,24 @@ class AnalyticsTab(QWidget):
         layout.setContentsMargins(0, 10, 0, 0)
         layout.setSpacing(8)
         layout.addWidget(self.controls_panel)
-        self.stats = self._metric_summary(layout, [metric[0] for metric in self.METRICS],
-                                          show_close=True)
+        self.daily_extreme_combo = style_toolbar_dropdown(QComboBox())
+        for key, label, _field, _gain in self.DAILY_EXTREMES:
+            self.daily_extreme_combo.addItem(label, key)
+        self.daily_extreme_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self.daily_extreme_combo.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        selected = self.daily_extreme_combo.findData(
+            self.db.setting(f"analytics_daily_extreme_{self.portfolio_id}"))
+        self.daily_extreme_combo.setCurrentIndex(max(0, selected))
+        self.daily_extreme_combo.setToolTip(
+            "Biggest one-day move: rank gains or losses independently by USD or percentage. "
+            "The largest dollar move and percentage move can occur on different dates.")
+        period_details = {}
+        period_stats = self._metric_summary(
+            layout, [metric[0] for metric in self.METRICS] +
+            ["Biggest one-day move", "Sharpe ratio"],
+            details=period_details, captions={"Biggest one-day move": self.daily_extreme_combo})
+        self.stats = {metric[0]: period_stats[metric[0]] for metric in self.METRICS}
+        self.as_of_label = period_details["NAV"]
         self.stats["NAV"].setToolTip("Account NAV at the latest completed close in this range")
         self.stats["NAV change"].setToolTip(
             "Change in account NAV from the closing value before this range, including external flows")
@@ -808,6 +919,26 @@ class AnalyticsTab(QWidget):
             "NAV change after removing deposits, withdrawals and asset transfers")
         self.stats["Adjusted performance"].setToolTip(
             "Compounded daily account returns after removing external flows")
+        self.daily_extreme_value = period_stats["Biggest one-day move"]
+        self.daily_extreme_detail = period_details["Biggest one-day move"]
+        self._daily_extreme_rows = []
+        self.daily_extreme_combo.currentIndexChanged.connect(self._daily_extreme_changed)
+        self.sharpe_value = period_stats["Sharpe ratio"]
+        self.sharpe_detail = period_details["Sharpe ratio"]
+        self.sharpe_value.setToolTip(
+            "Annualized Sharpe ratio for the selected period: mean daily excess return / "
+            "sample standard deviation of daily excess returns × √252. "
+            "Uses completed, flow-adjusted account returns and a 0% annual risk-free rate. "
+            "Requires at least 63 daily returns, consecutive NAV/flow coverage and nonzero volatility. "
+            "Provisional live NAV and flow-only dates are excluded.")
+        self.sharpe_detail.setToolTip(self.sharpe_value.toolTip())
+        self.daily_extreme_value.setToolTip(
+            "Largest completed one-day adjusted gain or loss for the chosen ranking. "
+            "Both USD P&L and percentage return are shown for that date. "
+            "Deposits, withdrawals and asset transfers are removed. "
+            "Requires consecutive NAV/flow coverage; provisional live NAV is excluded. "
+            "Ties show the earliest date.")
+        self.daily_extreme_detail.setToolTip(self.daily_extreme_value.toolTip())
         self.pnl_hint = QLabel("External flows include deposits, withdrawals and asset transfers.")
         self.pnl_hint.setObjectName("hint")
         self.pnl_hint.setWordWrap(True)
@@ -969,6 +1100,8 @@ class AnalyticsTab(QWidget):
 
     def refresh(self, *_):
         self.refresh_exposure()
+        if self.sections.currentWidget() is self.returns_page:
+            self.returns_page.refresh()
         query = self.db.setting("analytics_flex_query_id")
         status = self.db.metadata("ibkr_analytics_sync_status") or "not synced"
         completed = self.db.metadata("ibkr_analytics_sync_completed")
@@ -1025,6 +1158,19 @@ class AnalyticsTab(QWidget):
             value = (latest[key] if latest else None) if key in ("nav", "nav_change") else (
                 metric_rows[-1][key] if metric_rows else None)
             self.stats[label].setText(self._percent(value) if unit == "%" else self._money(value))
+        daily_rows = [row for row in completed if row["daily_pnl"] is not None] if complete else []
+        ratio = sharpe_ratio([{**row, "return": row["daily_return"]}
+                              for row in completed]) if complete else None
+        return_count = sum(row["daily_return"] is not None for row in completed)
+        self.sharpe_value.setText("—" if ratio is None else f"{ratio:.2f}")
+        self.sharpe_detail.setText(
+            f"Annualized · {return_count} daily returns" if ratio is not None else
+            "Incomplete NAV/flow coverage" if not complete and any(
+                row["performance"] is None for row in completed) else
+            f"Need 63 daily returns · {return_count} available" if return_count < 63 else
+            "Undefined · no return variation")
+        self._daily_extreme_rows = daily_rows
+        self._render_daily_extreme()
         for label, key in (("Bought", "bought"), ("Sold", "sold"), ("Net deployed", "net")):
             self.capital_stats[label].setText(
                 self._money(capital_totals[key] if capital_totals else None))
@@ -1052,6 +1198,36 @@ class AnalyticsTab(QWidget):
             (row["day"] + (" · provisional" if row["source"] == "live" else ""),
              row["cash"], row["nav"], row["percent"])
             for row in self._cash_share_rows])
+
+    def _daily_extreme_changed(self, *_):
+        self.db.set_setting(f"analytics_daily_extreme_{self.portfolio_id}",
+                            self.daily_extreme_combo.currentData())
+        self._render_daily_extreme()
+
+    def _render_daily_extreme(self):
+        self.daily_extreme_combo.ensurePolished()
+        self.daily_extreme_combo.setMinimumWidth(self.daily_extreme_combo.sizeHint().width())
+        _key, _label, field, gain = self.DAILY_EXTREMES[self.daily_extreme_combo.currentIndex()]
+        candidates = [row for row in self._daily_extreme_rows if row[field] is not None and
+                      (row[field] > 0 if gain else row[field] < 0)]
+        result = (max if gain else min)(candidates, key=lambda row: row[field], default=None)
+        value = self.daily_extreme_value
+        if result:
+            amount = self._money(result["daily_pnl"])
+            percent = self._percent(result["daily_return"] * 100)
+            value.setText(amount if field == "daily_pnl" else percent)
+            other = percent if field == "daily_pnl" else amount
+            self.daily_extreme_detail.setText(
+                f"{other} · {date.fromisoformat(result['day']):%d %b %Y}")
+        else:
+            value.setText("—")
+            self.daily_extreme_detail.setText(
+                ("No gain in this period" if gain else "No loss in this period")
+                if self._daily_extreme_rows else "—")
+        value.setProperty("pnlTrend", "positive" if result and gain else
+                          "negative" if result else "neutral")
+        value.style().unpolish(value)
+        value.style().polish(value)
 
     def refresh_exposure(self):
         self.exposure_page.refresh()
@@ -1410,4 +1586,12 @@ class AnalyticsTab(QWidget):
     def set_theme(self, theme):
         self.palette_name = theme
         self.exposure_page.set_theme(theme)
-        self.refresh()
+        self.returns_page.set_theme(theme)
+        # Theme changes only repaint cached results; rebuilding history and
+        # exposure here delays the header click, even on another tab.
+        for navigator in (self.pnl_navigator, self.capital_navigator):
+            navigator.palette_name = theme
+            navigator.update()
+        self._render_daily_extreme()
+        self._render_pnl_chart()
+        self._render_capital_chart()

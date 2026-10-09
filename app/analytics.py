@@ -70,10 +70,11 @@ def analytics_rows(snapshots, flows, lots, *, basis_complete=True):
         sell_day = lot.get("sell_date")
         basis = lot.get("buy_value_usd")
         commission = lot.get("buy_commission")
-        if buy_day and (basis is None or commission is None):
+        tax = lot.get("buy_tax", 0)
+        if buy_day and (basis is None or commission is None or tax is None):
             basis_complete = False
         elif buy_day:
-            invested = float(basis) + float(commission)
+            invested = float(basis) + float(commission) + float(tax)
             basis_events[buy_day] += invested
             if sell_day:
                 basis_events[sell_day] -= invested
